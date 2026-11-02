@@ -184,6 +184,10 @@ static float knob_frac(const knob_t *k)
 }
 
 /* ---------------------------------------------------------------------- UI --- */
+/* the screen's looks (the sky's area): HOME held and SELECT turned */
+enum { LOOK_REDWOOD, LOOK_SPECTRUM, LOOK_JCARD, NLOOKS };
+static const char *const LOOK_NAME[NLOOKS] = {"REDWOOD", "SPECTRUM", "J-CARD"};
+
 static struct {
     char msg[2][24];
     uint32_t msg_until;
@@ -195,6 +199,7 @@ static struct {
     uint32_t last_sec, last_ev;
     int turned;                          /* the knob last turned (lit a moment), -1 none */
     uint32_t turned_at;
+    uint8_t look;                        /* LOOK_*: HOME held and SELECT turned */
 } ui;
 
 void app_say(const char *a, const char *b)
@@ -411,7 +416,10 @@ static void input(void)
         app_say("VOICE", bl_voice_name(bl_par()->solo));
         dirty();
     }
-    if ((e = plat_enc(EN_SELECT)) != 0) {
+    if ((e = plat_enc(EN_SELECT)) != 0 && (btn >> B_HOME & 1u)) {
+        ui.look = (uint8_t)((ui.look + e + 3 * NLOOKS) % NLOOKS);
+        app_say("LOOK", LOOK_NAME[ui.look]);
+    } else if (e != 0) {
         char t[16];
         set.length = (uint8_t)clamp((int32_t)set.length + e, 0, (int32_t)NLENGTHS - 1);
         bl_par()->minutes = LENGTHS[set.length];
@@ -505,17 +513,42 @@ static void sky_row_rgb(int32_t y, float *c)    /* y 0..143 */
     }
 }
 
-static void draw_sky(uint32_t now)
+/* the notes since the last frame: a spark each, and a ring of the Spectrum look lit by its pitch */
+static float ring_glow[7];
+static void take_events(uint32_t now)
+{
+    const bl_status_t *st = bl_status();
+    static const uint8_t PC_RING[12] = {0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6};
+    while (ui.last_ev != st->ev_count) {
+        uint32_t e = ui.last_ev++ % 16u;
+        int note = st->ev[e].note;
+        spark[spark_i % NSPARK].x = (int16_t)clamp((int32_t)((note - 36) * 240 / 60), 4, 235);
+        spark[spark_i % NSPARK].y = (int16_t)(20 + (int32_t)((st->ev[e].layer * 37u + (uint32_t)note * 11u) % 70u));
+        spark[spark_i % NSPARK].t = now;
+        spark[spark_i % NSPARK].layer = st->ev[e].layer;
+        spark_i++;
+        ring_glow[PC_RING[((note % 12) + 12) % 12]] = 1.0f;
+    }
+}
+
+static void sky_turn(int s)              /* the sky turns slowly to the season's colours (about 6 s) */
+{
+    const sky_t *k = &SKY[s];
+    const uint8_t *tgt[4] = {k->top, k->mid, k->low, k->sun};
+    int i, j;
+    for (i = 0; i < 4; i++)
+        for (j = 0; j < 3; j++)
+            sky_now[i][j] += ((float)tgt[i][j] - sky_now[i][j]) * 0.012f;
+}
+
+static void draw_redwood(uint32_t now)
 {
     const bl_status_t *st = bl_status();
     int s = st->grove || st->sting_len ? st->season : BS_NSEASONS, i, j;
-    const sky_t *k = &SKY[s];
-    const uint8_t *tgt[4] = {k->top, k->mid, k->low, k->sun};
     int32_t y, cy = 118, cx = 120;
     float rr, glow = 0.0f;
-    for (i = 0; i < 4; i++)              /* the sky turns slowly to the new season (about 6 s) */
-        for (j = 0; j < 3; j++)
-            sky_now[i][j] += ((float)tgt[i][j] - sky_now[i][j]) * 0.012f;
+    (void)j;
+    sky_turn(s);
     rr = 14.0f + 16.0f * st->energy;     /* the sun breathes with the music */
     sun_r += (rr - sun_r) * 0.08f;
     glow = sun_r * 1.9f;
@@ -546,16 +579,7 @@ static void draw_sky(uint32_t now)
                 cv_pset(x, yy, (h >> 3) & 1u ? C_WHITE : RGB(170, 170, 220));
         }
     }
-    /* the sparks: a note each, rising as it fades */
-    while (ui.last_ev != st->ev_count) {
-        uint32_t e = ui.last_ev++ % 16u;
-        int note = st->ev[e].note;
-        spark[spark_i % NSPARK].x = (int16_t)clamp((int32_t)((note - 36) * 240 / 60), 4, 235);
-        spark[spark_i % NSPARK].y = (int16_t)(20 + (int32_t)((st->ev[e].layer * 37u + (uint32_t)note * 11u) % 70u));
-        spark[spark_i % NSPARK].t = now;
-        spark[spark_i % NSPARK].layer = st->ev[e].layer;
-        spark_i++;
-    }
+    take_events(now);
     for (i = 0; i < NSPARK; i++) {
         uint32_t age = now - spark[i].t;
         int32_t x = spark[i].x, yy, r;
@@ -578,6 +602,122 @@ static void draw_sky(uint32_t now)
     }
     cv_rect(0, 138, 240, 6, RGB(14, 12, 26));
     cv_blit(0, 32);
+}
+
+/* --- SPECTRUM: seven rings, root to crown from the outside in, each lit by the notes that fall on it; the room's
+ * own ring a little brighter; the whole breathing with the music */
+static const uint8_t CHAKRA[7][3] = {
+    {226, 74, 84}, {244, 142, 74}, {244, 206, 96}, {104, 200, 132}, {86, 166, 232}, {112, 100, 214}, {196, 128, 232},
+};
+static void disc_rows(int32_t cx, int32_t cy, float r, uint16_t c)
+{
+    int32_t y, y0 = cy - (int32_t)r, y1 = cy + (int32_t)r;
+    for (y = y0 < 0 ? 0 : y0; y <= y1 && y < 144; y++) {
+        float dy = (float)(y - cy), w2 = r * r - dy * dy;
+        if (w2 > 0.0f) {
+            int32_t w = (int32_t)(fm_sqrtf(w2) + 0.5f);
+            cv_rect(cx - w, y, 2 * w + 1, 1, c);
+        }
+    }
+}
+
+static void draw_spectrum(uint32_t now)
+{
+    const bl_status_t *st = bl_status();
+    int playing = st->grove || st->sting_len, k, room = bl_par()->room;
+    float breath = 0.94f + 0.08f * st->energy + 0.012f * fm_sinf((float)(now % 60000u) * 0.0011f);
+    static const float BG[3] = {10, 8, 24};
+    take_events(now);
+    cv_begin(240, 144, RGB(10, 8, 24));
+    {                                                            /* a few stars, twinkling */
+        uint32_t h = 0x2545F491u;
+        for (k = 0; k < 36; k++) {
+            h ^= h << 13; h ^= h >> 17; h ^= h << 5;
+            if (((h >> 20) + now / 500u) % 6u)
+                cv_pset((int32_t)(h % 240u), (int32_t)((h >> 8) % 144u), (h >> 3) & 1u ? RGB(120, 110, 170) : RGB(200, 196, 240));
+        }
+    }
+    for (k = 0; k < 7; k++) {
+        float c[3], lit = playing ? 0.52f + 0.48f * ring_glow[k] : 0.3f, r = (70.0f - 9.4f * (float)k) * breath;
+        int j;
+        if (k == room)
+            lit = fm_maxf(lit, playing ? 0.8f : 0.5f);
+        for (j = 0; j < 3; j++)
+            c[j] = (float)CHAKRA[k][j];
+        disc_rows(120, 72, r, mix3(BG, c, lit * 0.25f));          /* a dark gap, then the band */
+        disc_rows(120, 72, r - 1.5f, mix3(BG, c, lit));
+        ring_glow[k] *= 0.93f;
+    }
+    disc_rows(120, 72, 8.0f * breath, RGB(255, 244, 230));        /* the bindu */
+    cv_blit(0, 32);
+}
+
+/* --- J-CARD: the cassette itself, on an airbrushed sky over a grid that runs to the horizon; the reels turn
+ * while it plays and the tape winds from left to right through a timed piece */
+static void reel(int32_t cx, int32_t cy, float pack, float ang)
+{
+    int k;
+    disc_rows(cx, cy, pack, RGB(74, 48, 44));                    /* the tape wound on it */
+    disc_rows(cx, cy, 7.0f, RGB(236, 230, 220));                 /* the hub */
+    disc_rows(cx, cy, 3.0f, RGB(30, 24, 40));
+    for (k = 0; k < 6; k++) {                                    /* its teeth */
+        float a = ang + (float)k * 1.0472f;
+        cv_rect(cx + (int32_t)(5.0f * fm_cosf(a)), cy + (int32_t)(5.0f * fm_sinf(a)), 1, 1, RGB(30, 24, 40));
+    }
+}
+
+static void draw_jcard(uint32_t now)
+{
+    const bl_status_t *st = bl_status();
+    int s = st->grove || st->sting_len ? st->season : BS_NSEASONS, playing = st->grove || st->sting_len;
+    int32_t y, i;
+    float prog, ang = playing ? (float)(now % 100000u) * 0.0021f : 0.0f;
+    static const float GRID[3] = {246, 150, 210};
+    take_events(now);
+    sky_turn(s);
+    cv_begin(240, 144, C_BLACK);
+    for (y = 0; y < 90; y++) {                                   /* the sky, to the horizon */
+        float c[3];
+        sky_row_rgb(y * 144 / 90, c);
+        cv_rect(0, y, 240, 1, RGB((uint32_t)c[0], (uint32_t)c[1], (uint32_t)c[2]));
+    }
+    {                                                            /* the floor: lines that close in on the horizon */
+        static const float FLOOR[3] = {28, 14, 52};
+        float sh = (float)(now % 4000u) / 4000.0f;
+        cv_rect(0, 90, 240, 54, RGB(28, 14, 52));
+        for (i = 0; i < 9; i++) {
+            float z = ((float)i + 1.0f - (playing ? sh : 0.0f)) / 9.0f;
+            int32_t yy = 90 + (int32_t)(54.0f * z * z);
+            cv_rect(0, yy, 240, 1, mix3(FLOOR, GRID, 0.25f + 0.6f * z));
+        }
+        for (i = -7; i <= 7; i++)
+            cv_line(120 + i * 6, 90, 120 + i * 40, 143, mix3(FLOOR, GRID, 0.55f));
+        cv_rect(0, 90, 240, 1, mix3(FLOOR, GRID, 0.9f));
+    }
+    /* the shell, the label and its window */
+    cv_rect(36, 18, 168, 92, RGB(26, 22, 34));
+    cv_rect(38, 20, 164, 88, RGB(40, 34, 52));
+    cv_rect(46, 26, 148, 58, RGB(240, 232, 214));
+    for (i = 0; i < 7; i++)                                      /* a band of the room's colours across the label */
+        cv_rect(46, 28 + i * 3, 148, 3, RGB(CHAKRA[i][0], CHAKRA[i][1], CHAKRA[i][2]));
+    cv_text(52, 51, &FONT_XS, "BLISS BOX", RGB(60, 44, 80));
+    cv_text(150, 51, &FONT_XS, playing ? "SIDE A" : "SIDE B", RGB(150, 120, 150));
+    cv_rect(72, 64, 96, 32, RGB(22, 18, 28));
+    prog = st->grove && bl_par()->minutes ? fm_clampf((float)st->seconds / (60.0f * (float)bl_par()->minutes), 0, 1)
+           : st->sting_len ? st->sting_pos : 0.35f;
+    reel(96, 80, 8.0f + 7.0f * (1.0f - prog), ang);
+    reel(144, 80, 8.0f + 7.0f * prog, ang * 1.3f);
+    cv_blit(0, 32);
+}
+
+static void draw_sky(uint32_t now)
+{
+    if (ui.look == LOOK_SPECTRUM)
+        draw_spectrum(now);
+    else if (ui.look == LOOK_JCARD)
+        draw_jcard(now);
+    else
+        draw_redwood(now);
 }
 
 static void time_text(uint32_t s, char *t)
