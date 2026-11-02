@@ -60,6 +60,9 @@ static int settings_ok(const settings_t *s)
 /* ------------------------------------------------------------------- audio --- */
 static float gain_now;
 static volatile uint8_t panicked;
+static volatile uint32_t load_pk;                /* the longest render since HOME was pressed, in % of a block */
+
+void app_overload(void) { bl_shed(); }
 
 void app_render(int32_t *lr, uint32_t n, uint32_t master_q12)
 {
@@ -73,7 +76,13 @@ void app_render(int32_t *lr, uint32_t n, uint32_t master_q12)
             lr[i] = 0;
         return;
     }
-    bl_render(l, r, (int)n);
+    {
+        uint32_t t0 = plat_ticks24(), pct;
+        bl_render(l, r, (int)n);
+        pct = (plat_ticks24() - t0) * 100u / (n * (PLAT_TICKS_PER_US * 1000000u / 44100u));
+        if (pct > load_pk)
+            load_pk = pct;
+    }
     dg = (gain - g) / (float)n * 0.25f;  /* MASTER glides over a few blocks: no step */
     for (i = 0; i < n; i++) {
         g += dg;
@@ -417,6 +426,8 @@ static void input(void)
         dirty();
     }
     midi_in();
+    if ((btn & ~ui.btn) >> B_HOME & 1u)
+        load_pk = 0;                     /* HOME pressed: the peak afresh */
     ui.keys = keys;
     ui.btn = btn;
     lit = 1u << PAGE_BTN[ui.page];
@@ -430,9 +441,19 @@ static void input(void)
         lit |= 1u << B_PLAY;
     if (bl_status()->sting_len)
         lit |= 1u << B_REC;
-    plat_play_red(bl_status()->grove == 2);
-    plat_glow(1);
-    plat_leds(btn | lit, keys);
+    {                                    /* the lights only when they change: the main loop spins fast */
+        static uint32_t was_b = ~0u, was_k = ~0u;
+        static int was_red = -1;
+        int red = bl_status()->grove == 2;
+        if ((btn | lit) != was_b || keys != was_k || red != was_red) {
+            plat_play_red(red);
+            plat_glow(1);
+            plat_leds(btn | lit, keys);
+            was_b = btn | lit;
+            was_k = keys;
+            was_red = red;
+        }
+    }
 }
 
 void app_input_only(void) { input(); }
@@ -581,7 +602,10 @@ static void draw_header(uint32_t now)
         text_cat(t, "DSP ");
         int_text((int32_t)plat_cpu_pct(), n);
         text_cat(t, n);
-        text_cat(t, "%  XRUN ");
+        text_cat(t, "% PK ");
+        int_text((int32_t)load_pk, n);
+        text_cat(t, n);
+        text_cat(t, "% X ");
         int_text((int32_t)plat_xruns(), n);
         text_cat(t, n);
         text_cat(t, "  V ");

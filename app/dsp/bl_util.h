@@ -158,6 +158,20 @@ static inline float blep(float t, float dt)
     return 0.0f;
 }
 static inline float saw_blep(float ph, float dt) { return 2.0f * ph - 1.0f - blep(ph, dt); }
+/* the same saw at an integer phase p, stepping d a sample (inv_d = 1 / (float)d): the wrap is free */
+static inline float saw_u(uint32_t p, uint32_t d, float inv_d)
+{
+    float s = (float)(int32_t)(p + 0x80000000u) * (1.0f / 2147483648.0f);
+    if (p < d) {
+        float t = (float)p * inv_d;
+        return s - (t + t - t * t - 1.0f);
+    }
+    if (p > ~d) {
+        float t = -(float)(0u - p) * inv_d;
+        return s - (t * t + t + t + 1.0f);
+    }
+    return s;
+}
 
 /* --- equal-power pan ---------------------------------------------------------------------------------- */
 static inline void pan_gains(float p, float *l, float *r)   /* p -1 .. 1 */

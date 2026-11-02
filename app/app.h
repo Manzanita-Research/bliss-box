@@ -16,6 +16,8 @@ enum { OBJ_SETTINGS, OBJ_PANEL, OBJ_NOBJ };
 void app_init(void);
 void app_render(int32_t *lr, uint32_t n, uint32_t master_q12);
 void app_panic(void);
+#define APP_OVERLOAD                     /* a render over 90 % of its time: the engine lets a voice go */
+void app_overload(void);
 void app_ui_init(void);
 void app_frame(void);
 void app_input_only(void);

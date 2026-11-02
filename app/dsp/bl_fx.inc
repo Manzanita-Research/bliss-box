@@ -361,60 +361,80 @@ static BL_NOINLINE void tape_run(float *l, float *r, int n, int on, float wear, 
         TP.drop_t = rng_range(&TP.rng, 0.25f, 0.7f);
     }
     {
-        /* the speed's swing: worked out every TP_STEP samples, ramped between */
-        float d0 = TP.d, dd, hpc = TP.hpc, az = 0.35f * wear;
+        /* stage by stage, the state of each in locals: first the delay and the dropout gain a sample, then each
+         * channel through the record chain into the loop and back out through the moving head */
+        float dbuf[BL_BLOCK], gbuf[BL_BLOCK], obuf[2][BL_BLOCK];
+        float d0 = TP.d, dd = 0.0f, drop = TP.drop, az = 0.35f * wear;
+        uint32_t left = TP.drop_left;
+        int32_t w0 = TP.w;
         int j = 0;
-        dd = 0.0f;
         for (i = 0; i < n; i++) {
-            float in[2] = {l[i], r[i]}, out[2], g;
-            if (j-- == 0) {
+            if (j-- == 0) {                                  /* the speed's swing: every TP_STEP samples, ramped */
                 float d1;
                 j = TP_STEP - 1;
                 TP.wow = wrap1(TP.wow + wr * TP_STEP);
                 TP.flut = wrap1(TP.flut + fr * TP_STEP);
                 TP.drift += 0.00003f * TP_STEP * (TP.dph - TP.drift);
-                d1 = 64.0f + wow_d * sin1(TP.wow) + flut_d * sin1(TP.flut) + TP.drift;
+                d1 = 100.0f + wow_d * sin1(TP.wow) + flut_d * sin1(TP.flut) + TP.drift;   /* 4 .. 196 */
                 dd = (d1 - d0) * (1.0f / TP_STEP);
             }
             d0 += dd;
-            if (TP.drop_left) {
-                TP.drop_left--;
-                TP.drop += 0.004f * (TP.drop_t - TP.drop);
+            dbuf[i] = d0;
+            if (left) {
+                left--;
+                drop += 0.004f * (TP.drop_t - drop);
             } else
-                TP.drop += 0.002f * (1.0f - TP.drop);
-            g = TP.drop;
-            for (c = 0; c < 2; c++) {
-                bq_t *st = TP.s[c];
-                float h;
-                x = bq_run(&st[0], &TP.pre, in[c]);
-                x = soft(x * drive) * comp;
-                x = bq_run(&st[1], &TP.de, x);
-                x = bq_run(&st[2], &TP.bump, x);
-                TP.hp[c] += hpc * (x - TP.hp[c]);              /* 30 Hz: a one-pole is plenty */
-                x = bq_run(&st[4], &TP.lp, x - TP.hp[c]);
-                tp_buf[c][TP.w] = x;
-                x = tapf(tp_buf[c], TP.w, c ? d0 + az : d0, TP_LEN - 1) * g;
-                /* hiss: white, a little more on top (a one-pole's difference) */
-                h = rng_bi(&TP.rng);
-                TP.hs[c][0] += 0.35f * (h - TP.hs[c][0]);
-                x += (h - 0.6f * TP.hs[c][0]) * hiss_g;
-                out[c] = x;
-            }
-            TP.w = (TP.w + 1) & (TP_LEN - 1);
-            x = out[0];
-            out[0] += 0.03f * out[1];
-            out[1] += 0.03f * x;
-            if (a0 == 1.0f && a1 == 1.0f) {
-                l[i] = out[0];
-                r[i] = out[1];
-            } else {
-                /* the bypass: a crossfade (the dry is ahead of the tape by its delay; over 0.1 s it is a blur) */
-                float a = a0 + (a1 - a0) * (float)i / (float)n;
-                l[i] += a * (out[0] - l[i]);
-                r[i] += a * (out[1] - r[i]);
-            }
+                drop += 0.002f * (1.0f - drop);
+            gbuf[i] = drop;
         }
         TP.d = d0;
+        TP.drop = drop;
+        TP.drop_left = left;
+        for (c = 0; c < 2; c++) {
+            const float *in = c ? r : l;
+            float *buf = tp_buf[c], *o = obuf[c];
+            bq_t s0 = TP.s[c][0], s1 = TP.s[c][1], s2 = TP.s[c][2], s4 = TP.s[c][4];
+            const bq_c pre = TP.pre, de = TP.de, bump = TP.bump, lp = TP.lp;
+            float hp = TP.hp[c], hpc = TP.hpc, hs = TP.hs[c][0], off = c ? az : 0.0f;
+            bl_rng_t rng = TP.rng;
+            int32_t w = w0;
+            for (i = 0; i < n; i++) {                        /* record: the chain into the loop */
+                x = bq_run(&s0, &pre, in[i]);
+                x = soft(x * drive) * comp;
+                x = bq_run(&s1, &de, x);
+                x = bq_run(&s2, &bump, x);
+                hp += hpc * (x - hp);                        /* 30 Hz: a one-pole is plenty */
+                buf[w] = bq_run(&s4, &lp, x - hp);
+                w = (w + 1) & (TP_LEN - 1);
+            }
+            w = w0;
+            for (i = 0; i < n; i++) {                        /* play: the head (at least 4 samples behind), hiss */
+                float h = rng_bi(&rng);
+                hs += 0.35f * (h - hs);                      /* white, a little more on top */
+                o[i] = tapf(buf, w, dbuf[i] + off, TP_LEN - 1) * gbuf[i] + (h - 0.6f * hs) * hiss_g;
+                w = (w + 1) & (TP_LEN - 1);
+            }
+            TP.s[c][0] = s0;
+            TP.s[c][1] = s1;
+            TP.s[c][2] = s2;
+            TP.s[c][4] = s4;
+            TP.hp[c] = hp;
+            TP.hs[c][0] = hs;
+            TP.rng = rng;
+        }
+        TP.w = (w0 + n) & (TP_LEN - 1);
+        if (a0 == 1.0f && a1 == 1.0f)
+            for (i = 0; i < n; i++) {                        /* a little crosstalk */
+                l[i] = obuf[0][i] + 0.03f * obuf[1][i];
+                r[i] = obuf[1][i] + 0.03f * obuf[0][i];
+            }
+        else
+            for (i = 0; i < n; i++) {
+                /* the bypass: a crossfade (the dry is ahead of the tape by its delay; over 0.1 s it is a blur) */
+                float a = a0 + (a1 - a0) * (float)i / (float)n;
+                l[i] += a * (obuf[0][i] + 0.03f * obuf[1][i] - l[i]);
+                r[i] += a * (obuf[1][i] + 0.03f * obuf[0][i] - r[i]);
+            }
     }
 }
 
@@ -477,7 +497,7 @@ static void fx_clear(void)
             TP.s[k][i].z1 = TP.s[k][i].z2 = 0.0f;
     TP.w = 0;
     TP.wow = TP.flut = TP.drift = TP.dph = TP.drift_t = 0.0f;
-    TP.d = 64.0f;
+    TP.d = 100.0f;
     TP.hp[0] = TP.hp[1] = 0.0f;
     TP.drop = 1.0f;
     TP.drop_left = 0;

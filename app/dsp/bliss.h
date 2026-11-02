@@ -91,6 +91,7 @@ void bl_post_note(int midi, float vel);             /* the solo voice: vel 0 = o
 void bl_post_grove(int on);                         /* start (from silence) or stop (a long release) */
 void bl_post_sting(int seconds, uint32_t seed);     /* 3, 5, 10 or 30: the same seed is the same sting */
 void bl_post_panic(void);
+void bl_shed(void);                                 /* the render ran late: let a voice go (audio context) */
 
 /* names */
 const char *bl_voice_name(int v);

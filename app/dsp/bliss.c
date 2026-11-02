@@ -974,6 +974,44 @@ void bl_post_grove(int on) { post(E_GROVE, on, 0, 0, 0.0f); }
 void bl_post_sting(int seconds, uint32_t seed) { post(E_STING, 0, (uint16_t)seconds, seed, 0.0f); }
 void bl_post_panic(void) { post(E_PANIC, 0, 0, 0, 0.0f); }
 
+/* The audio interrupt ran late (the platform's app_overload, from the interrupt itself, after a render): the next
+ * render lets go of the voice that costs the least to lose. A word the interrupt writes and the render reads, both on
+ * the one core, so no queue. */
+static volatile uint32_t shed_req;
+void bl_shed(void) { shed_req++; }
+static void shed_run(void)
+{
+    static uint32_t done;
+    int i, cost = 0;
+    for (i = 0; i < NVOICES; i++)
+        if (V[i].on && V[i].hold != -2.0f)       /* voices already shed (hold -2) are on their way out */
+            cost += voice_cost(&V[i]);
+    /* more voices than the CPU can render: the quietest let go, a quiet one at once, else in 20 ms.
+     * And on an overrun (app_overload, bl_shed) one more, held or not, save a played solo key. */
+    while (cost > BL_VOICE_BUDGET || shed_req != done) {
+        int best = -1, forced = shed_req != done;
+        float lowest = 1e9f;
+        for (i = 0; i < NVOICES; i++) {
+            float lv;
+            if (!V[i].on || V[i].hold == -2.0f || (V[i].layer == L_SOLO && V[i].gate) || (V[i].gate && !forced))
+                continue;
+            lv = V[i].env * V[i].dec * (V[i].gate ? 4.0f : 1.0f) * V[i].gain;
+            if (lv < lowest) {
+                lowest = lv;
+                best = i;
+            }
+        }
+        done = shed_req;
+        if (best < 0)
+            break;
+        cost -= voice_cost(&V[best]);
+        voice_release(&V[best], 0.02f);
+        V[best].hold = -2.0f;     /* marked: shed */
+        if (V[best].env * V[best].dec < 0.003f)
+            voice_free(&V[best]);
+    }
+}
+
 static void solo_note(int midi, float vel)
 {
     int i, t = P.solo;
@@ -1047,6 +1085,7 @@ void bl_render(float *l, float *r, int n)
     if (n > BL_BLOCK)
         n = BL_BLOCK;
     events_run();
+    shed_run();
     se = &SEAS[G.season];
     /* the slow LFOs: 47, 73, 131 and 211 seconds */
     {
