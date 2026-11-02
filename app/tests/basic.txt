@@ -1,0 +1,55 @@
+# Bliss Box in the host simulator: base/tools/build.py app --host, then
+#   app/build/host/blissbox_host app/tests/basic.txt app/build/host
+wait 900
+shot boot.png
+expect grove 0
+tap PLAY
+wait 8000
+expect grove 1
+shot grove.png
+key 7 down 100 0
+wait 60
+key 7 up
+wait 30
+tap FX
+wait 30
+expect page 2
+turn K1 5
+wait 100
+shot space.png
+tap GLO
+wait 30
+expect talk 1
+tap SEL
+wait 30
+expect tape 0
+tap SEL
+wait 30
+turn ALGO -2
+wait 30
+expect room 1
+turn PRESET 2
+wait 30
+expect solo 2
+tap EDIT
+wait 30
+shot tuning.png
+tap PLAY
+wait 30
+expect grove 0
+tap REC
+wait 1500
+expect sting 5
+shot sting.png
+tap OCT+
+wait 30
+expect octave 1
+tap SAVE
+wait 30
+expect dirty 0
+reboot
+wait 900
+expect octave 1
+expect room 1
+expect solo 2
+expect talk 0

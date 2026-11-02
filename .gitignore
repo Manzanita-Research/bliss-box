@@ -1,0 +1,7 @@
+build/
+app/build/
+renders/*.wav
+renders/**/*.wav
+renders/**/*.mp3
+*.ppm
+.DS_Store

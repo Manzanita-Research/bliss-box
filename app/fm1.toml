@@ -1,0 +1,15 @@
+# Bliss Box's build settings (base/tools/build.py)
+name = "BLISSBOX"              # APP_NAME is in app.h; this names the build's files
+id_prefix = "FM-1_432"         # package identity: dev FM-1_432000, releases FM-1_432XXYYZZ
+usb_manufacturer = "Manzanita Research"
+usb_product = "BLISS BOX FM-1"
+o2 = ["dsp/bliss.c"]           # the sound engine, at -O2
+include = ["dsp"]
+words = "words.tsv"
+ble = false
+usb_audio_in = true            # the FM-1 recordable over USB at 44.1 kHz
+# the site
+tagline = "a dreamy cosmic instrument: a self-playing grove of 80s new age, stings, and a cassette deck"
+repo = "https://github.com/Manzanita-Research/bliss-box"
+licence = "MPL-2.0"
+credits = "Built on fm1-base by Charles Vestal (MPL-2.0)."
