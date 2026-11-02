@@ -185,8 +185,8 @@ static float knob_frac(const knob_t *k)
 
 /* ---------------------------------------------------------------------- UI --- */
 /* the screen's looks (the sky's area): HOME held and SELECT turned */
-enum { LOOK_REDWOOD, LOOK_SPECTRUM, LOOK_JCARD, NLOOKS };
-static const char *const LOOK_NAME[NLOOKS] = {"REDWOOD", "SPECTRUM", "J-CARD"};
+enum { LOOK_REDWOOD, LOOK_SPECTRUM, LOOK_JCARD, LOOK_PAINTED, NLOOKS };
+static const char *const LOOK_NAME[NLOOKS] = {"REDWOOD", "SPECTRUM", "J-CARD", "PAINTED"};
 
 static struct {
     char msg[2][24];
@@ -541,6 +541,23 @@ static void sky_turn(int s)              /* the sky turns slowly to the season's
             sky_now[i][j] += ((float)tgt[i][j] - sky_now[i][j]) * 0.012f;
 }
 
+static void draw_sparks(uint32_t now)     /* a spark for each note, rising and fading */
+{
+    int i;
+    for (i = 0; i < NSPARK; i++) {
+        uint32_t age = now - spark[i].t;
+        int32_t x = spark[i].x, yy, r;
+        uint16_t c;
+        if (!spark[i].t || age > 3000u)
+            continue;
+        yy = spark[i].y - (int32_t)(age / 120u);
+        r = age < 600u ? 3 : age < 1600u ? 2 : 1;
+        c = age < 1200u ? C_WHITE : RGB(255, 230, 200);
+        cv_rect(x - r, yy, 2 * r + 1, 1, c);
+        cv_rect(x, yy - r, 1, 2 * r + 1, c);
+    }
+}
+
 static void draw_redwood(uint32_t now)
 {
     const bl_status_t *st = bl_status();
@@ -580,18 +597,7 @@ static void draw_redwood(uint32_t now)
         }
     }
     take_events(now);
-    for (i = 0; i < NSPARK; i++) {
-        uint32_t age = now - spark[i].t;
-        int32_t x = spark[i].x, yy, r;
-        uint16_t c;
-        if (!spark[i].t || age > 3000u)
-            continue;
-        yy = spark[i].y - (int32_t)(age / 120u);
-        r = age < 600u ? 3 : age < 1600u ? 2 : 1;
-        c = age < 1200u ? C_WHITE : RGB(255, 230, 200);
-        cv_rect(x - r, yy, 2 * r + 1, 1, c);
-        cv_rect(x, yy - r, 1, 2 * r + 1, c);
-    }
+    draw_sparks(now);
     /* the redwoods, against the light */
     for (i = 0; i < (int)NTREES; i++) {
         int32_t x = TREES[i][0], h = TREES[i][1], hw = TREES[i][2], top = 144 - h;
@@ -710,9 +716,88 @@ static void draw_jcard(uint32_t now)
     cv_blit(0, 32);
 }
 
+/* --- PAINTED: an airbrushed sky for each season (tools/paint.py, app/paint.h), dissolving into the next as the
+ * Grove turns; stars twinkle on the night ones and the notes spark over it */
+#include "paint.h"
+static const uint8_t SEASON_PAINT[BS_NSEASONS + 1] = {
+    PAINT_REDWOOD_DAWN, PAINT_COSMIC_RINGS, PAINT_REDWOOD_DAWN,  /* dawn, temple, garden */
+    PAINT_COAST_AURORA, PAINT_REDWOOD_DUSK, PAINT_COAST_AURORA,  /* stars, still, river */
+    PAINT_REDWOOD_DUSK,                                          /* resting */
+};
+/* The painting on show lives in RAM (the pool): each frame copies it to the canvas and draws on top, so the flash
+ * (where the DSP's code also runs from) is read once per painting, not twenty times a second. A season's turn
+ * dissolves into it: each pixel takes the new painting's at its own moment, read from the flash as it does. */
+static uint16_t paint_buf[PAINT_W * PAINT_H] __attribute__((section(".pool")));
+static struct { uint8_t to, loaded; uint32_t t0, at; } paint;
+#define PAINT_FADE_MS 4000u
+
+static inline uint32_t paint_hash(uint32_t i)   /* a hash with no pattern in it: a speckle, not stripes */
+{
+    uint32_t h = i * 0x9E3779B1u;
+    h ^= h >> 15;
+    h *= 0x85EBCA77u;
+    h ^= h >> 13;
+    return h & 0xFFFFu;
+}
+
+static void draw_painted(uint32_t now)
+{
+    const bl_status_t *st = bl_status();
+    int s = st->grove || st->sting_len ? st->season : BS_NSEASONS, k;
+    uint32_t i;
+    take_events(now);
+    if (!paint.loaded) {
+        const uint16_t *b = (const uint16_t *)PAINT[SEASON_PAINT[s]];
+        for (i = 0; i < PAINT_W * PAINT_H; i++)
+            paint_buf[i] = b[i];
+        paint.to = SEASON_PAINT[s];
+        paint.at = 65536u;
+        paint.loaded = 1;
+    } else if (SEASON_PAINT[s] != paint.to) {        /* the season turned: dissolve from what shows now */
+        paint.to = SEASON_PAINT[s];
+        paint.t0 = now;
+        paint.at = 0;
+    }
+    if (paint.at < 65536u) {
+        const uint16_t *b = (const uint16_t *)PAINT[paint.to];
+        uint32_t fade = now - paint.t0, at = fade >= PAINT_FADE_MS ? 65536u : fade * 65536u / PAINT_FADE_MS;
+        for (i = 0; i < PAINT_W * PAINT_H; i++) {
+            uint32_t h = paint_hash(i);
+            if (h >= paint.at && h < at)
+                paint_buf[i] = b[i];
+        }
+        paint.at = at;
+    }
+    cv_begin(240, 144, C_BLACK);
+    for (i = 0; i < PAINT_W * PAINT_H; i++)
+        cv_px[i] = paint_buf[i];
+    if (paint.to != PAINT_REDWOOD_DAWN) {             /* stars in the upper sky, twinkling */
+        uint32_t h = 0x6C8E9CF5u;
+        for (k = 0; k < 28; k++) {
+            int32_t x, y;
+            h ^= h << 13; h ^= h >> 17; h ^= h << 5;
+            x = (int32_t)(h % 240u);
+            y = (int32_t)((h >> 8) % 56u);
+            if (((h >> 20) + now / 450u) % 5u == 0u) {
+                cv_pset(x, y, C_WHITE);
+                if ((h >> 4) & 1u) {
+                    cv_pset(x - 1, y, RGB(200, 190, 240));
+                    cv_pset(x + 1, y, RGB(200, 190, 240));
+                    cv_pset(x, y - 1, RGB(200, 190, 240));
+                    cv_pset(x, y + 1, RGB(200, 190, 240));
+                }
+            }
+        }
+    }
+    draw_sparks(now);
+    cv_blit(0, 32);
+}
+
 static void draw_sky(uint32_t now)
 {
-    if (ui.look == LOOK_SPECTRUM)
+    if (ui.look == LOOK_PAINTED)
+        draw_painted(now);
+    else if (ui.look == LOOK_SPECTRUM)
         draw_spectrum(now);
     else if (ui.look == LOOK_JCARD)
         draw_jcard(now);

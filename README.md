@@ -20,7 +20,7 @@ lets you play over it, and runs it all through a cassette deck you can wear down
 - **Cassette** on the master: pre/de-emphasis, saturation, head bump, wow, flutter, drift, hiss, and dropouts as
   it wears. WEAR runs from fresh chrome to the thrift-store bin. Tap SELECT to bypass it.
 - **TALK**: a gentle 1–4 kHz dip that leaves room for your voice. Tap GLO.
-- **Three screen looks**: Redwood, Spectrum, J-card. Hold HOME and turn SELECT.
+- **Four screen looks**: Redwood, Spectrum, J-card, and Painted (an airbrushed sky for each season of the Grove, dissolving as it turns; `tools/paint.py` makes them from `renders/painted/src`). Hold HOME and turn SELECT.
 
 ## Layout
 
