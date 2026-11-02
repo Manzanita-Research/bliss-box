@@ -653,14 +653,8 @@ static void draw_footer(uint32_t now)
     char t[32];
     int32_t x, i;
     cv_begin(240, 64, C_BLACK);
-    /* the room, the chord, the season; the voice and octave */
-    x = cv_text(8, 2, &FONT_B, bl_room_key(bl_par()->room), RGB(246, 196, 170));
-    x = cv_text(x + 6, 6, &FONT_XS, bl_room_name(bl_par()->room), C_GRAY);
-    x = cv_text(x + 6, 6, &FONT_XS, bl_mode_name(bl_par()->mode), C_DIM);
-    if (st->grove || st->sting_len) {
-        x = cv_text(x + 8, 6, &FONT_XS, st->chord_name, C_WHITE);
-        cv_text(x + 8, 6, &FONT_XS, bl_season_name(st->season), RGB(150, 210, 255));
-    }
+    /* the voice and octave on the right; on the left the room's key, then what fits of the chord, the season,
+     * the room's name and the mode (in that order of need), drawn in reading order */
     t[0] = 0;
     text_cat(t, bl_voice_name(bl_par()->solo));
     text_cat(t, set.octave < 0 ? " -" : set.octave > 0 ? " +" : "");
@@ -668,7 +662,30 @@ static void draw_footer(uint32_t now)
         char o[4] = {(char)('0' + (set.octave < 0 ? -set.octave : set.octave)), 0};
         text_cat(t, o);
     }
-    cv_text(232 - text_w(&FONT_XS, t), 6, &FONT_XS, t, RGB(246, 170, 140));
+    i = 232 - text_w(&FONT_XS, t);
+    cv_text(i, 6, &FONT_XS, t, RGB(246, 170, 140));
+    {
+        int playing = st->grove || st->sting_len;
+        const char *name[4] = {playing ? st->chord_name : 0, playing ? bl_season_name(st->season) : 0,
+                               bl_room_name(bl_par()->room), bl_mode_name(bl_par()->mode)};
+        int show[4] = {0, 0, 0, 0}, k;
+        int32_t room = i - 8;                         /* the left group ends 8 px before the voice */
+        x = 8 + text_w(&FONT_B, bl_room_key(bl_par()->room));
+        for (k = 0; k < 4; k++)
+            if (name[k] && x + 8 + text_w(&FONT_XS, name[k]) <= room) {
+                show[k] = 1;
+                x += 8 + text_w(&FONT_XS, name[k]);
+            }
+        x = cv_text(8, 2, &FONT_B, bl_room_key(bl_par()->room), RGB(246, 196, 170));
+        if (show[2])
+            x = cv_text(x + 6, 6, &FONT_XS, name[2], C_GRAY);
+        if (show[3])
+            x = cv_text(x + 6, 6, &FONT_XS, name[3], C_DIM);
+        if (show[0])
+            x = cv_text(x + 8, 6, &FONT_XS, name[0], C_WHITE);
+        if (show[1])
+            cv_text(x + 8, 6, &FONT_XS, name[1], RGB(150, 210, 255));
+    }
     /* the page's four knobs */
     cv_rect(0, 24, 240, 1, C_LINE);
     for (i = 0; i < 4; i++) {

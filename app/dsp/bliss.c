@@ -1012,6 +1012,13 @@ static void shed_run(void)
     }
 }
 
+/* the voices level with each other as solos (loudest 400 ms of tools/render.c's solo phrase within a dB or so:
+ * -14 for the keys and plucks, -15.5 for the pads): the bed keeps its own balance */
+static const float SOLO_TRIM[BV_NTYPES] = {
+    0.89f, /* rhodes */ 1.78f, /* cp80 */ 1.0f, /* flute */ 1.78f, /* harp */ 1.11f, /* zither */
+    1.10f, /* bells */ 1.78f, /* strings */ 0.65f, /* choir */ 1.97f /* glass */
+};
+
 static void solo_note(int midi, float vel)
 {
     int i, t = P.solo;
@@ -1031,7 +1038,7 @@ static void solo_note(int midi, float vel)
                 ev_note(midi, t, vel, L_SOLO);
                 return;
             }
-    voice_start(t, L_SOLO, midi, bl_note_hz(midi), vel, 1.0f, fm_clampf((float)(midi - 66) / 20.0f, -0.5f, 0.5f),
+    voice_start(t, L_SOLO, midi, bl_note_hz(midi), vel, SOLO_TRIM[t], fm_clampf((float)(midi - 66) / 20.0f, -0.5f, 0.5f),
                 is_pad(t) ? 0.3f : t == BV_FLUTE ? 0.12f : 0.0f, is_pad(t) ? 2.5f : 0.0f, -1.0f);
     ev_note(midi, t, vel, L_SOLO);
 }
