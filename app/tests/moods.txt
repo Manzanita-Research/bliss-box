@@ -1,0 +1,54 @@
+# The moods and the bottom octave: base/tools/build.py app --host, then
+#   app/build/host/blissbox_host app/tests/moods.txt OUTDIR
+wait 900
+expect mood 2
+expect room 3
+shot mood-redwoods.png
+# SELECT: the mood, and its own key (DAWN: D)
+turn SELECT -2
+wait 30
+expect mood 0
+expect room 1
+expect grove 0
+wait 1500
+shot mood-dawn.png
+# the bottom octave from silence: A (key 4) starts the Grove on the progression's A chord
+key 4 down 90 0
+wait 200
+expect grove 1
+expect root 9
+wait 6000
+shot steer-a.png
+key 4 up
+wait 30
+expect grove 1
+# a note outside D major (F, key 0): a borrowed chord on F, held
+key 0 down 90 0
+wait 3000
+expect root 5
+key 0 up
+# the keys above play the solo voice and leave the Grove where it is
+key 14 down 100 0
+wait 60
+key 14 up
+expect root 5
+# the four parts' page
+tap HOME
+wait 30
+expect page 0
+turn K3 -5
+wait 100
+shot home-parts.png
+tap LFO
+wait 30
+shot grove-page.png
+# a new mood while it plays: at the next chord
+turn SELECT 3
+wait 30
+expect mood 3
+expect room 2
+wait 4000
+shot stars.png
+tap PLAY
+wait 30
+expect grove 0

@@ -7,9 +7,9 @@ tap PLAY
 wait 8000
 expect grove 1
 shot grove.png
-key 7 down 100 0
+key 16 down 100 0
 wait 60
-key 7 up
+key 16 up
 wait 30
 tap FX
 wait 30

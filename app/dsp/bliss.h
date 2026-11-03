@@ -30,20 +30,26 @@ enum {
 /* scales (the room's mode) */
 enum { BM_PENTA, BM_LYDIAN, BM_MAJOR, BM_DORIAN, BM_NMODES };
 
-/* Grove seasons: which layers play and how */
-enum { BS_DAWN, BS_TEMPLE, BS_GARDEN, BS_STARS, BS_STILL, BS_RIVER, BS_NSEASONS };
+/* the moods: each one a key, a scale, its progressions and the voices of its four parts (BS_: they grew from the
+ * Grove's old seasons, and the screen still paints one sky for each) */
+enum { BS_DAWN, BS_TEMPLE, BS_REDWOODS, BS_STARS, BS_STILL, BS_RIVER, BS_NSEASONS };
+#define BL_NMOODS BS_NSEASONS
 
 typedef struct {
     /* harmony */
     int room;          /* 0..6: Halpern's chakra keys C D E F G A B (root .. crown) */
-    int mode;          /* BM_* */
     int just;          /* 0 equal temperament, 1 just intonation on the room's root */
     int a432;          /* 0 A=440, 1 A=432 */
     /* the Grove */
-    float activity;    /* 0..1: how often the melodic layers speak */
-    float drift;       /* 0..1: how far the harmony wanders from home */
-    float bed;         /* 0..1: pad level */
-    float melody;      /* 0..1: melodic layers' level */
+    int mood;          /* BS_*: the key's default (bl_mood_room), the scale, the progressions, the voices */
+    float activity;    /* 0..1: how busy the motion and the melody are, and how fast the chords change */
+    float drift;       /* 0..1: how far each pass through a progression strays (a chord's colour, another progression) */
+    float bloom;       /* 0..1: how much the sounds open and close (filters, FM brightness, the choir's vowel) */
+    /* the four parts' levels */
+    float bed;         /* 0..1: the pad (the chords) */
+    float low;         /* 0..1: the low part (the bass under the chords) */
+    float motion;      /* 0..1: the rippling part (harp, zither, Rhodes, CP-80 or bells) */
+    float melody;      /* 0..1: the melody (flute or bells) */
     int minutes;       /* 0 endless, else the piece ends itself after this many minutes */
     /* the solo voice (the keys) */
     int solo;          /* BV_* */
@@ -64,7 +70,10 @@ typedef struct {
 /* what the screen shows */
 typedef struct {
     int grove;            /* 1 playing, 2 closing (a timed piece's ending), 0 stopped */
-    int season;           /* BS_* */
+    int season;           /* BS_*: the mood playing (resting: the one chosen; a sting: its own) */
+    int section;          /* the Grove's shape: 0 arriving, 1 blooming, 2 floating, 3 returning */
+    int root_pc;          /* the chord's root, 0..11 (C = 0): the bottom octave lights it; -1 none */
+    float bloom;          /* 0..1 now */
     int room_now;         /* where the harmony is now (drift can move it away from home) */
     int chord[8];         /* the pad's notes now (MIDI), chord_n of them */
     int chord_n;
@@ -79,6 +88,7 @@ typedef struct {
     uint32_t ev_count;
     struct { int8_t note; uint8_t type; uint8_t vel; uint8_t layer; } ev[16];
     float cpu_voices;     /* voices sounding */
+    float cost;           /* what they cost, in the units of the voice budget (180) */
 } bl_status_t;
 
 void bl_init(uint32_t seed);
@@ -91,6 +101,8 @@ void bl_post_note(int midi, float vel);             /* the solo voice: vel 0 = o
 void bl_post_grove(int on);                         /* start (from silence) or stop (a long release) */
 void bl_post_sting(int seconds, uint32_t seed);     /* 3, 5, 10 or 30: the same seed is the same sting */
 void bl_post_panic(void);
+void bl_post_steer(int pc);                         /* the bottom octave: the Grove to a chord on pc (0..11, C = 0)
+                                                     * and there while held (and it starts the Grove); -1 lets go */
 void bl_shed(void);                                 /* the render ran late: let a voice go (audio context) */
 
 /* names */
@@ -98,5 +110,7 @@ const char *bl_voice_name(int v);
 const char *bl_mode_name(int m);
 const char *bl_room_name(int r);      /* "ROOT" .. "CROWN" */
 const char *bl_room_key(int r);       /* "C" .. "B" */
-const char *bl_season_name(int s);
+const char *bl_season_name(int s);   /* the mood's name: "DAWN" .. */
+int bl_mood_room(int m);              /* the mood's own key (a room, 0..6) */
+int bl_mood_mode(int m);              /* and its scale (BM_*) */
 float bl_note_hz(int midi);           /* in the current tuning */

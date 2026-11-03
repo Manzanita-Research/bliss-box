@@ -5,8 +5,10 @@
  *   build/render grove 600 out.wav [key=value ...]
  *   build/render sting 10 out.wav seed=1234
  *   build/render solo rhodes out.wav
- * Keys: room mode just a432 activity drift bed melody minutes space echo shimmer tone talk tape wear hiss level seed
- * It prints the peak, the RMS, and the clipped-sample count. */
+ * Keys: mood room just a432 activity drift bloom bed low motion melody minutes space echo shimmer tone talk tape wear
+ * hiss level seed steer=PC@SECONDS (the bottom octave held from then, -1 lets go; up to 16)
+ * mood= sets the room to the mood's own key; give room= after it to move it.
+ * It prints the peak, the RMS, the clipped-sample count and the voices' cost (the FM-1's budget is 180). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,7 +18,12 @@
 
 static FILE *wav;
 static uint32_t frames;
-static double sumsq;
+static double sumsq, cost_sum;
+static float cost_peak;
+static long cost_n, cost_over;
+static int logc;
+static char last_chord[16];
+static int last_sect = -1;
 static float peak;
 static long clipped;
 
@@ -65,6 +72,19 @@ static void run(double seconds)
     while (done < n) {
         int k = n - done < BL_BLOCK ? (int)(n - done) : BL_BLOCK, i;
         bl_render(l, r, k);
+        cost_sum += bl_status()->cost;
+        cost_n++;
+        cost_over += bl_status()->cost > 180.0f;
+        if (logc && (strcmp(last_chord, bl_status()->chord_name) || last_sect != bl_status()->section)) {
+            static const char *SN[4] = {"arrive", "bloom", "float", "return"};
+            const bl_status_t *st = bl_status();
+            printf("  %6.1f  %-8s %-7s %-10s bloom %.2f\n", frames / 44100.0, bl_season_name(st->season),
+                   st->grove ? SN[st->section & 3] : "-", st->chord_name, st->bloom);
+            strcpy(last_chord, st->chord_name);
+            last_sect = st->section;
+        }
+        if (bl_status()->cost > cost_peak)
+            cost_peak = bl_status()->cost;
         for (i = 0; i < k; i++) {
             put(l[i]);
             put(r[i]);
@@ -84,6 +104,8 @@ static int voice_by_name(const char *s)
 }
 
 static uint32_t seed = 1;
+static int nsteer, steer_pc[16];
+static double steer_at[16];
 static void set(const char *kv)
 {
     bl_par_t *p = bl_par();
@@ -97,9 +119,21 @@ static void set(const char *kv)
     v = (float)atof(eq + 1);
 #define F(name) else if (!strcmp(k, #name)) p->name = v
 #define I(name) else if (!strcmp(k, #name)) p->name = (int)v
-    if (!strcmp(k, "seed")) seed = (uint32_t)strtoul(eq + 1, 0, 10);
+    if (!strcmp(k, "log")) logc = (int)v;
+    else if (!strcmp(k, "seed")) seed = (uint32_t)strtoul(eq + 1, 0, 10);
+    else if (!strcmp(k, "steer")) {
+        if (nsteer < 16) {
+            const char *at = strchr(eq + 1, '@');
+            steer_pc[nsteer] = atoi(eq + 1);
+            steer_at[nsteer++] = at ? atof(at + 1) : 0.0;
+        }
+    }
+    else if (!strcmp(k, "mood")) {
+        p->mood = (int)v;
+        p->room = bl_mood_room(p->mood);
+    }
     else if (!strcmp(k, "solo")) p->solo = voice_by_name(eq + 1);
-    I(room); I(mode); I(just); I(a432); F(activity); F(drift); F(bed); F(melody); I(minutes);
+    I(room); I(just); I(a432); F(activity); F(drift); F(bloom); F(bed); F(low); F(motion); F(melody); I(minutes);
     F(space); F(echo); F(shimmer); F(tone); I(talk); I(tape); F(wear); F(hiss); F(level); F(solo_level);
     else fprintf(stderr, "unknown key %s\n", k);
 }
@@ -158,8 +192,18 @@ int main(int argc, char **argv)
     c0 = clock();
     if (!strcmp(argv[1], "grove")) {
         secs = atof(argv[2]);
+        double t = 0.0;
+        int j;
         bl_post_grove(1);
-        run(secs);
+        for (j = 0; j < nsteer; j++)
+            if (steer_at[j] < secs) {
+                if (steer_at[j] > t) {
+                    run(steer_at[j] - t);
+                    t = steer_at[j];
+                }
+                bl_post_steer(steer_pc[j]);
+            }
+        run(secs - t);
     } else if (!strcmp(argv[1], "sting")) {
         int s = atoi(argv[2]);
         run(0.3);
@@ -180,6 +224,8 @@ int main(int argc, char **argv)
         double rms = sqrt(sumsq / (2.0 * frames));
         printf("%s: %.1fs  peak %.2f dBFS  rms %.1f dBFS  clipped %ld  (%.0fx realtime on this machine)\n", argv[3],
                frames / 44100.0, 20 * log10(peak + 1e-12), 20 * log10(rms + 1e-12), clipped, (frames / 44100.0) / (el + 1e-9));
+        printf("  voice cost: average %.0f, peak %.0f, over the budget (180) %.2f%% of blocks\n", cost_sum / (cost_n ? cost_n : 1),
+               cost_peak, 100.0 * cost_over / (cost_n ? cost_n : 1));
     }
     return 0;
 }
