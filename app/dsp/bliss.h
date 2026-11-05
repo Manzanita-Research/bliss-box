@@ -51,8 +51,8 @@ typedef struct {
     float motion;      /* 0..1: the rippling part (harp, zither, Rhodes, CP-80 or bells) */
     float melody;      /* 0..1: the melody (flute or bells) */
     int minutes;       /* 0 endless, else the piece ends itself after this many minutes */
-    /* the solo voice (the keys) */
-    int solo;          /* BV_* */
+    /* the keys: what you play (and the harmony the band follows) */
+    int solo;          /* BV_*: the voice the keys play (a mood brings its own: bl_mood_touch) */
     float solo_level;  /* 0..1 */
     /* space */
     float space;       /* 0..1: hall size and mix */
@@ -69,7 +69,12 @@ typedef struct {
 
 /* what the screen shows */
 typedef struct {
-    int grove;            /* 1 playing, 2 closing (a timed piece's ending), 0 stopped */
+    int grove;            /* PLAY: 1 playing by itself, 2 closing (a timed piece's ending), 0 off */
+    int band;             /* 1 the band is sounding (by itself, or following the keys) */
+    int hands;            /* 1 the harmony is the keys' (until they let go and the sustain runs out) */
+    uint32_t chord_seq;   /* one more for each chord the keys make: the screen shows it */
+    uint16_t chord_pcs;   /* the chord's pitch classes (bit 0 = C): the keys that fit light */
+    int bass_pc;          /* the bass's note, 0..11 */
     int season;           /* BS_*: the mood playing (resting: the one chosen; a sting: its own) */
     int section;          /* the Grove's shape: 0 arriving, 1 blooming, 2 floating, 3 returning */
     int root_pc;          /* the chord's root, 0..11 (C = 0): the bottom octave lights it; -1 none */
@@ -97,12 +102,10 @@ bl_par_t *bl_par(void);                             /* the live parameters (main
 const bl_status_t *bl_status(void);
 
 /* events from the main loop */
-void bl_post_note(int midi, float vel);             /* the solo voice: vel 0 = off */
+void bl_post_note(int midi, float vel);             /* a key: it sounds, and what's held leads the band; vel 0 = off */
 void bl_post_grove(int on);                         /* start (from silence) or stop (a long release) */
 void bl_post_sting(int seconds, uint32_t seed);     /* 3, 5, 10 or 30: the same seed is the same sting */
 void bl_post_panic(void);
-void bl_post_steer(int pc);                         /* the bottom octave: the Grove to a chord on pc (0..11, C = 0)
-                                                     * and there while held (and it starts the Grove); -1 lets go */
 void bl_shed(void);                                 /* the render ran late: let a voice go (audio context) */
 
 /* names */
@@ -113,4 +116,7 @@ const char *bl_room_key(int r);       /* "C" .. "B" */
 const char *bl_season_name(int s);   /* the mood's name: "DAWN" .. */
 int bl_mood_room(int m);              /* the mood's own key (a room, 0..6) */
 int bl_mood_mode(int m);              /* and its scale (BM_*) */
+int bl_mood_touch(int m);             /* and the voice its keys play (BV_*) */
+int bl_scale_note(int degree);        /* the mood's scale in its key: degree 1 the tonic between F3 and E4, 8 (or 6 in a
+                                       * pentatonic) an octave up, 0 and below the notes under it (tools/render) */
 float bl_note_hz(int midi);           /* in the current tuning */

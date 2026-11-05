@@ -5,8 +5,14 @@
  *   build/render grove 600 out.wav [key=value ...]
  *   build/render sting 10 out.wav seed=1234
  *   build/render solo rhodes out.wav
+ *   build/render play tools/play/dawn.txt out.wav mood=0
  * Keys: mood room just a432 activity drift bloom bed low motion melody minutes space echo shimmer tone talk tape wear
- * hiss level seed steer=PC@SECONDS (the bottom octave held from then, -1 lets go; up to 16)
+ * hiss level seed solo solo_level
+ * A play script is somebody at the keys, a line each (# a comment):
+ *   SECONDS NOTES VEL LEN   NOTES: the mood's scale degrees, comma-separated (1 the tonic, 8 or 6 an octave up, 0 and
+ *                           below the notes under it), or MIDI notes as m62; all at once (a chord), VEL 0..1, held LEN s
+ *   SECONDS play | stop     PLAY on or off
+ *   SECONDS end             where the render stops
  * mood= sets the room to the mood's own key; give room= after it to move it.
  * It prints the peak, the RMS, the clipped-sample count and the voices' cost (the FM-1's budget is 180). */
 #include <stdio.h>
@@ -79,7 +85,7 @@ static void run(double seconds)
             static const char *SN[4] = {"arrive", "bloom", "float", "return"};
             const bl_status_t *st = bl_status();
             printf("  %6.1f  %-8s %-7s %-10s bloom %.2f\n", frames / 44100.0, bl_season_name(st->season),
-                   st->grove ? SN[st->section & 3] : "-", st->chord_name, st->bloom);
+                   st->grove ? SN[st->section & 3] : st->band ? (st->hands ? "keys" : "band") : "-", st->chord_name, st->bloom);
             strcpy(last_chord, st->chord_name);
             last_sect = st->section;
         }
@@ -104,8 +110,6 @@ static int voice_by_name(const char *s)
 }
 
 static uint32_t seed = 1;
-static int nsteer, steer_pc[16];
-static double steer_at[16];
 static void set(const char *kv)
 {
     bl_par_t *p = bl_par();
@@ -121,16 +125,10 @@ static void set(const char *kv)
 #define I(name) else if (!strcmp(k, #name)) p->name = (int)v
     if (!strcmp(k, "log")) logc = (int)v;
     else if (!strcmp(k, "seed")) seed = (uint32_t)strtoul(eq + 1, 0, 10);
-    else if (!strcmp(k, "steer")) {
-        if (nsteer < 16) {
-            const char *at = strchr(eq + 1, '@');
-            steer_pc[nsteer] = atoi(eq + 1);
-            steer_at[nsteer++] = at ? atof(at + 1) : 0.0;
-        }
-    }
     else if (!strcmp(k, "mood")) {
         p->mood = (int)v;
         p->room = bl_mood_room(p->mood);
+        p->solo = bl_mood_touch(p->mood);
     }
     else if (!strcmp(k, "solo")) p->solo = voice_by_name(eq + 1);
     I(room); I(just); I(a432); F(activity); F(drift); F(bloom); F(bed); F(low); F(motion); F(melody); I(minutes);
@@ -173,13 +171,86 @@ static void solo_demo(void)
     run(26.0 - t);
 }
 
+/* somebody at the keys (the script's lines above) */
+typedef struct { double at; int what, note; float vel; } pev_t;   /* what: 0 a key (vel 0 up), 1 PLAY on, 2 off, 3 end */
+static int pev_cmp(const void *a, const void *b)
+{
+    const pev_t *x = a, *y = b;
+    if (x->at != y->at)
+        return x->at < y->at ? -1 : 1;
+    return (x->vel > 0.0f) - (y->vel > 0.0f);           /* at the same moment: the keys up first */
+}
+static double play_script(const char *path)
+{
+    static pev_t ev[2048];
+    char line[256];
+    int ne = 0, i;
+    double t = 0.0, end = 0.0;
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        perror(path);
+        exit(1);
+    }
+    while (fgets(line, sizeof line, f) && ne < 2000) {
+        char notes[128], *tok;
+        double at, len;
+        float vel;
+        if (line[0] == '#' || line[0] == '\n')
+            continue;
+        if (sscanf(line, "%lf %127s", &at, notes) < 2)
+            continue;
+        if (!strcmp(notes, "play") || !strcmp(notes, "stop") || !strcmp(notes, "end")) {
+            ev[ne].at = at;
+            ev[ne].what = notes[0] == 'p' ? 1 : notes[0] == 's' ? 2 : 3;
+            ev[ne].vel = 0.0f;
+            ne++;
+            if (notes[0] == 'e')
+                end = at;
+            continue;
+        }
+        if (sscanf(line, "%lf %127s %f %lf", &at, notes, &vel, &len) < 4)
+            continue;
+        for (tok = strtok(notes, ","); tok && ne < 2000; tok = strtok(0, ",")) {
+            int note = tok[0] == 'm' ? atoi(tok + 1) : bl_scale_note(atoi(tok));
+            ev[ne].at = at;
+            ev[ne].what = 0;
+            ev[ne].note = note;
+            ev[ne].vel = vel;
+            ne++;
+            ev[ne].at = at + len;
+            ev[ne].what = 0;
+            ev[ne].note = note;
+            ev[ne].vel = 0.0f;
+            ne++;
+            if (at + len > end)
+                end = at + len;
+        }
+    }
+    fclose(f);
+    qsort(ev, ne, sizeof ev[0], pev_cmp);
+    for (i = 0; i < ne; i++) {
+        if (ev[i].at > t) {
+            run(ev[i].at - t);
+            t = ev[i].at;
+        }
+        if (ev[i].what == 3)
+            return t;
+        if (ev[i].what)
+            bl_post_grove(ev[i].what == 1);
+        else
+            bl_post_note(ev[i].note, ev[i].vel);
+    }
+    run(end + 15.0 - t);
+    return end + 15.0;
+}
+
 int main(int argc, char **argv)
 {
     int i;
     clock_t c0;
     double secs;
     if (argc < 4) {
-        fprintf(stderr, "usage: render grove SECONDS out.wav [k=v..] | sting SECONDS out.wav [k=v..] | solo VOICE out.wav [k=v..]\n");
+        fprintf(stderr, "usage: render grove SECONDS out.wav [k=v..] | sting SECONDS out.wav [k=v..] | solo VOICE out.wav [k=v..] | play SCRIPT out.wav [k=v..]\n");
         return 2;
     }
     for (i = 4; i < argc; i++)
@@ -192,18 +263,8 @@ int main(int argc, char **argv)
     c0 = clock();
     if (!strcmp(argv[1], "grove")) {
         secs = atof(argv[2]);
-        double t = 0.0;
-        int j;
         bl_post_grove(1);
-        for (j = 0; j < nsteer; j++)
-            if (steer_at[j] < secs) {
-                if (steer_at[j] > t) {
-                    run(steer_at[j] - t);
-                    t = steer_at[j];
-                }
-                bl_post_steer(steer_pc[j]);
-            }
-        run(secs - t);
+        run(secs);
     } else if (!strcmp(argv[1], "sting")) {
         int s = atoi(argv[2]);
         run(0.3);
@@ -214,6 +275,8 @@ int main(int argc, char **argv)
         bl_par()->solo = voice_by_name(argv[2]);
         solo_demo();
         secs = 26.0;
+    } else if (!strcmp(argv[1], "play")) {
+        secs = play_script(argv[2]);
     } else {
         fprintf(stderr, "unknown mode %s\n", argv[1]);
         return 2;

@@ -1,0 +1,17 @@
+# STILL (G pentatonic, the bells): mood=4. Pentatonic degrees: 1 G, 2 A, 3 B, 4 D, 5 E, 6 the octave
+0.8 1,3,4,7 0.5 4.5
+2.0 8 0.4 0.8
+3.0 9 0.45 0.8
+4.0 10 0.4 1.8
+# E minor, slowly
+7.0 5,6,8 0.45 4.5
+8.2 11 0.4 0.8
+9.2 10 0.4 0.8
+10.2 8 0.45 2.0
+# A, alone
+13.0 2 0.5 2.4
+13.8 9 0.4 0.8
+14.6 7 0.4 1.6
+# stop for the answer; then home, and let go
+20.0 1,4,6 0.45 4.0
+21.0 10 0.4 2.5

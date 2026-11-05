@@ -239,10 +239,12 @@ static voice_t *voice_start(int type, int layer, int note, float f, float vel, f
         v->udph[2] = uturns(f * (f * 14.0f < 15000.0f ? 14.0f : 7.0f) * BL_INV_SR);
         v->amp[0] = (0.35f + 1.9f * vel * vel) * 0.159155f;     /* body index, in turns */
         v->amul[0] = t60_mul(1.4f);
-        v->amp[1] = (0.25f + 1.0f * vel) * 0.159155f;           /* tine index */
-        v->amul[1] = t60_mul(0.11f * fm_exp2f(-pitch * 0.5f));
+        v->amp[1] = (0.15f + 0.6f * vel) * 0.159155f;           /* tine index */
+        v->amul[1] = t60_mul(0.09f * fm_exp2f(-pitch * 0.5f));
         v->x[0] = 0.25f * 0.159155f;                            /* the body index never quite goes */
-        v->x[1] = 0.12f + 0.45f * vel;                          /* pickup bark */
+        v->x[1] = 0.1f + 0.3f * vel;                            /* pickup bark */
+        v->x[3] = 0.55f;                                        /* the body: a sine under it all, ringing longer */
+        v->x[4] = t60_mul(t60 * 1.6f);
         break;
     }
     case BV_CP80: {
@@ -257,7 +259,7 @@ static voice_t *voice_start(int type, int layer, int note, float f, float vel, f
         v->x[4] = 0.0f;
         for (n = 0; n < 5; n++) {
             float k = (float)(n + 1), fn = f * k * fm_sqrtf(1.0f + 0.00028f * k * k);
-            float a = fm_powf(k, -tilt) * 0.42f;
+            float a = fm_powf(k, -tilt) * 0.42f * (n == 0 ? 1.5f : n == 1 ? 1.25f : 1.0f);   /* weight below */
             float r = t60_mul(t1 / (1.0f + 0.5f * (float)n * (1.0f + f / 900.0f)));
             int s;
             if (fn >= 9000.0f)
@@ -294,7 +296,7 @@ static voice_t *voice_start(int type, int layer, int note, float f, float vel, f
     case BV_HARP:
     case BV_ZITHER: {
         int zither = type == BV_ZITHER, s;
-        float t60 = fm_clampf(5.5f * fm_exp2f(-pitch * 0.55f), 1.2f, 8.0f) * (zither ? 1.5f : 1.0f);
+        float t60 = fm_clampf(7.5f * fm_exp2f(-pitch * 0.55f), 2.0f, 10.0f) * (zither ? 1.5f : 1.0f);
         float bright = zither ? 0.72f + 0.2f * vel : 0.42f + 0.33f * vel;
         v->perc = 1;
         v->env_c = 1.0f;
@@ -320,11 +322,12 @@ static voice_t *voice_start(int type, int layer, int note, float f, float vel, f
         v->udph[1] = uturns(f * 3.5f * BL_INV_SR);
         v->udph[2] = uturns((f * 2.0f + 0.45f) * BL_INV_SR);
         v->udph[3] = uturns((f * 2.0f + 0.45f) * 1.4142f * BL_INV_SR);
-        v->amp[0] = (0.6f + 1.8f * vel) * 0.159155f;
-        v->amul[0] = t60_mul(1.8f);
-        v->amp[1] = (0.4f + 0.9f * vel) * 0.159155f;
-        v->amul[1] = t60_mul(0.5f);
-        v->amp[2] = 0.33f;                                      /* the strike partial's level */
+        float soft = fm_clampf(fm_exp2f(-0.4f * pitch), 0.45f, 1.1f);   /* gentler up high */
+        v->amp[0] = (0.4f + 1.0f * vel) * soft * 0.159155f;
+        v->amul[0] = t60_mul(1.0f);
+        v->amp[1] = (0.3f + 0.6f * vel) * soft * 0.159155f;
+        v->amul[1] = t60_mul(0.4f);
+        v->amp[2] = 0.22f;                                      /* the strike partial's level */
         v->amul[2] = t60_mul(t60 * 0.35f);
         v->x[0] = 0.18f * 0.159155f;
         break;
@@ -389,15 +392,16 @@ static BL_NOINLINE int vb_rhodes(voice_t *restrict v, int n, const voice_ctx_t *
     uint32_t p0 = v->uph[0], p1 = v->uph[1], p2 = v->uph[2], d0 = v->udph[0], d1 = v->udph[1], d2 = v->udph[2];
     float g = v->gain, env = v->env, ec = v->env_c, et = v->env_tgt, dec = v->dec, dm = v->dec_m;
     float a0 = v->amp[0], a1 = v->amp[1], m0 = v->amul[0], m1 = v->amul[1], floor0 = v->x[0], bark = v->x[1];
-    float dc = v->x[2];
+    float dc = v->x[2], body = v->x[3], bm = v->x[4];
     (void)cx;
     for (i = 0; i < n; i++) {
-        float s = sinu(p0 + uturns((a0 + floor0) * sinu(p1) + a1 * sinu(p2)));
+        float b = sinu(p1), s = sinu(p0 + uturns((a0 + floor0) * b + a1 * sinu(p2)));
         env += ec * (et - env);
         s = s + bark * s * s;
         dc += (s - dc) * 0.002f;                                /* DC out */
-        vbuf[i] = (s - dc) * env * dec * g;
+        vbuf[i] = ((s - dc) * dec + b * body) * env * g;
         dec *= dm;
+        body *= bm;
         a0 *= m0;
         a1 *= m1;
         p0 += d0;
@@ -412,6 +416,7 @@ static BL_NOINLINE int vb_rhodes(voice_t *restrict v, int n, const voice_ctx_t *
     v->amp[0] = a0;
     v->amp[1] = a1;
     v->x[2] = dc;
+    v->x[3] = body;
     return 1;
 }
 

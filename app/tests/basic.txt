@@ -30,7 +30,7 @@ wait 30
 expect room 1
 turn PRESET 2
 wait 30
-expect solo 2
+expect solo 3
 tap EDIT
 wait 30
 shot tuning.png
@@ -51,5 +51,5 @@ reboot
 wait 900
 expect octave 1
 expect room 1
-expect solo 2
+expect solo 3
 expect talk 0

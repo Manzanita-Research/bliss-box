@@ -5,22 +5,24 @@
  *
  * The panel
  *   SELECT      the mood: its key, its scale, its progressions, the voices of the Grove's four parts
- *   PLAY        the Grove: start, or let it close (a long release)
+ *   PLAY        the Grove plays by itself: start, or let it close (a long release); off, the band only follows you
  *   REC         a new sting (a new seed) at the sting length; SEQ plays the last one again; ARP the length
- *   HOME LFO FX ENV EDIT   the pages K1..K4 turn: HOME (the four parts' levels), GROVE, SPACE, TAPE, TUNING
+ *   HOME LFO FX ENV EDIT   the pages K1..K4 turn: HOME (BLOOM, MOTION, SPACE, ECHO), GROVE, SPACE, TAPE, TUNING;
+ *               HOME again, MIX (the band's four parts' levels)
  *   GLO         TALK: the Grove steps back for a voice
  *   SEL         the cassette in or out
  *   SAVE        keeps the settings
  *   OCT- OCT+   the upper keys' octave
  *   ALGO        the key (a room); PRESET the voice the keys play; HOME held and SELECT turned, the look
- * The bottom octave (F3 to E4) steers the Grove: a key moves it to a chord on that note and holds it there (and
- * starts it, from silence); let go and the progression goes on. The keys above play the solo voice with velocity,
- * and so does MIDI in (any channel). */
+ * Every key plays the mood's own voice with velocity (and so does MIDI in, any channel), and what you hold leads the
+ * band: two or more keys are the chord, one key a chord of the scale on it. From silence the band comes in under
+ * you; let go and the chord rings on a while, then the Grove goes on by itself (PLAY on) or fades (PLAY off).
+ * The keys you hold light; the chord's other notes glow. */
 #include "fastmath.h"
 #include "bliss.h"
 
 /* ---------------------------------------------------------------- settings --- */
-#define SET_MAGIC 0x424C5332u            /* "BLS2": the moods (BLS1's settings start afresh) */
+#define SET_MAGIC 0x424C5333u            /* "BLS3": the keys lead (BLS2's settings start afresh) */
 static const uint8_t LENGTHS[] = {0, 5, 10, 15, 20, 30, 45, 60};   /* the piece, minutes (0: endless) */
 static const uint8_t STING_S[] = {3, 5, 10, 30};
 #define NLENGTHS (sizeof LENGTHS)
@@ -119,15 +121,16 @@ typedef struct {
 } knob_t;
 #define KF(n, f) {n, K_F, (uint8_t)__builtin_offsetof(bl_par_t, f)}
 #define KI(n, k, f) {n, k, (uint8_t)__builtin_offsetof(bl_par_t, f)}
-enum { PG_HOME, PG_GROVE, PG_SPACE, PG_TAPE, PG_TUNING, NPAGES };
-static const char *const PAGE_NAME[NPAGES] = {"HOME", "GROVE", "SPACE", "TAPE", "TUNING"};
-static const uint8_t PAGE_BTN[NPAGES] = {B_HOME, B_LFO, B_FX, B_ENV, B_EDIT};
+enum { PG_HOME, PG_GROVE, PG_SPACE, PG_TAPE, PG_TUNING, PG_MIX, NPAGES };
+static const char *const PAGE_NAME[NPAGES] = {"HOME", "GROVE", "SPACE", "TAPE", "TUNING", "MIX"};
+static const uint8_t PAGE_BTN[NPAGES] = {B_HOME, B_LFO, B_FX, B_ENV, B_EDIT, B_HOME};   /* HOME twice: MIX */
 static const knob_t PAGES[NPAGES][4] = {
-    {KF("PAD", bed), KF("LOW", low), KF("MOTION", motion), KF("MELODY", melody)},          /* the four parts */
-    {{"LENGTH", K_LEN, 0}, KF("BLOOM", bloom), KF("ACTIVITY", activity), KF("SOLO", solo_level)},
+    {KF("BLOOM", bloom), KF("MOTION", activity), KF("SPACE", space), KF("ECHO", echo)},   /* what you play with */
+    {{"LENGTH", K_LEN, 0}, KF("DRIFT", drift), KF("SOLO", solo_level), KF("MELODY", melody)},
     {KF("SPACE", space), KF("ECHO", echo), KF("SHIMMER", shimmer), KF("TONE", tone)},
     {KF("WEAR", wear), KF("HISS", hiss), KI("TAPE", K_BOOL, tape), KF("LEVEL", level)},
     {KI("KEY", K_ROOM, room), KF("DRIFT", drift), KI("JUST", K_BOOL, just), KI("A432", K_BOOL, a432)},
+    {KF("PAD", bed), KF("LOW", low), KF("MOTION", motion), KF("MELODY", melody)},          /* the band's four parts */
 };
 
 static float *kf(const knob_t *k) { return (float *)((char *)bl_par() + k->off); }
@@ -207,9 +210,8 @@ static struct {
     int turned;                          /* the knob last turned (lit a moment), -1 none */
     uint32_t turned_at;
     uint8_t look;                        /* LOOK_*: HOME held and SELECT turned */
-    int8_t steer;                        /* the bottom octave's key steering the Grove, -1 none */
+    uint32_t chord_seq, chord_at;        /* the keys' last chord, and when it came (the screen shows it big) */
 } ui;
-#define STEER_KEYS 12u                   /* F3 .. E4 */
 
 void app_say(const char *a, const char *b)
 {
@@ -309,6 +311,8 @@ static void button(uint32_t k)
     uint32_t p;
     for (p = 0; p < NPAGES; p++)
         if (PAGE_BTN[p] == k) {
+            if (k == B_HOME && ui.page == PG_HOME)
+                p = PG_MIX;
             ui.page = (uint8_t)p;
             app_say(PAGE_NAME[p], "");
             return;
@@ -393,20 +397,6 @@ static void input(void)
     keys = touch_keys();
     for (k = 0; k < NKEYS; k++) {        /* key 0 is F3 (MIDI 53) */
         uint32_t bit = 1u << k;
-        if (k < STEER_KEYS) {            /* the bottom octave steers: the last one pressed, while it's held */
-            if ((keys & bit) && !(ui.keys & bit)) {
-                ui.steer = (int8_t)k;
-                bl_post_steer((53 + (int)k) % 12);
-            } else if (!(keys & bit) && (ui.keys & bit) && ui.steer == (int8_t)k) {
-                uint32_t held = keys & ((1u << STEER_KEYS) - 1u), j;
-                ui.steer = -1;
-                for (j = 0; j < STEER_KEYS; j++)  /* another still held: to it */
-                    if (held >> j & 1u)
-                        ui.steer = (int8_t)j;
-                bl_post_steer(ui.steer < 0 ? -1 : (53 + ui.steer) % 12);
-            }
-            continue;
-        }
         if ((keys & bit) && !(ui.keys & bit)) {
             uint32_t v = touch_vel(k);
             int32_t note = 53 + (int32_t)k + 12 * set.octave;
@@ -445,8 +435,10 @@ static void input(void)
         app_say("LOOK", LOOK_NAME[ui.look]);
     } else if (e != 0) {                 /* the mood, and its own key (ALGO moves the key after) */
         char t[24];
+        solo_all_off();
         bl_par()->mood = (int)((bl_par()->mood + e + 3 * BL_NMOODS) % BL_NMOODS);
         bl_par()->room = bl_mood_room(bl_par()->mood);
+        bl_par()->solo = bl_mood_touch(bl_par()->mood);   /* the keys play the mood's own voice (PRESET another) */
         t[0] = 0;
         text_cat(t, bl_room_key(bl_par()->room));
         text_cat(t, " ");
@@ -473,16 +465,20 @@ static void input(void)
     {                                    /* the lights only when they change: the main loop spins fast */
         static uint32_t was_b = ~0u, was_k = ~0u;
         static int was_red = -1;
-        int red = bl_status()->grove == 2, pc = bl_status()->root_pc;
-        uint32_t kl = keys;
-        if (bl_status()->grove && pc >= 0)      /* the bottom octave lights the chord's root */
-            kl |= 1u << ((pc - 5 + 12) % 12);
-        if ((btn | lit) != was_b || kl != was_k || red != was_red) {
+        static uint32_t was_m = ~0u;
+        int red = bl_status()->grove == 2;
+        uint32_t pcs = bl_status()->chord_pcs, kl = keys, km = 0;
+        for (k = 0; k < NKEYS; k++)      /* the chord's notes glow on every key that plays them (key 0 is F) */
+            if (pcs >> ((5u + k) % 12u) & 1u)
+                km |= 1u << k;
+        if ((btn | lit) != was_b || kl != was_k || km != was_m || red != was_red) {
             plat_play_red(red);
             plat_glow(1);
             plat_leds(btn | lit, kl);
+            plat_lights_mid(0, km);
             was_b = btn | lit;
             was_k = kl;
+            was_m = km;
             was_red = red;
         }
     }
@@ -631,7 +627,6 @@ static void draw_redwood(uint32_t now)
         }
     }
     cv_rect(0, 138, 240, 6, RGB(14, 12, 26));
-    cv_blit(0, 32);
 }
 
 /* --- SPECTRUM: seven rings, root to crown from the outside in, each lit by the notes that fall on it; the room's
@@ -654,7 +649,7 @@ static void disc_rows(int32_t cx, int32_t cy, float r, uint16_t c)
 static void draw_spectrum(uint32_t now)
 {
     const bl_status_t *st = bl_status();
-    int playing = st->grove || st->sting_len, k, room = bl_par()->room;
+    int playing = st->band || st->sting_len, k, room = bl_par()->room;
     float breath = 0.94f + 0.08f * st->energy + 0.012f * fm_sinf((float)(now % 60000u) * 0.0011f);
     static const float BG[3] = {10, 8, 24};
     take_events(now);
@@ -679,7 +674,6 @@ static void draw_spectrum(uint32_t now)
         ring_glow[k] *= 0.93f;
     }
     disc_rows(120, 72, 8.0f * breath, RGB(255, 244, 230));        /* the bindu */
-    cv_blit(0, 32);
 }
 
 /* --- J-CARD: the cassette itself, on an airbrushed sky over a grid that runs to the horizon; the reels turn
@@ -699,7 +693,7 @@ static void reel(int32_t cx, int32_t cy, float pack, float ang)
 static void draw_jcard(uint32_t now)
 {
     const bl_status_t *st = bl_status();
-    int s = st->season, playing = st->grove || st->sting_len;
+    int s = st->season, playing = st->band || st->sting_len;
     int32_t y, i;
     float prog, ang = playing ? (float)(now % 100000u) * 0.0021f : 0.0f;
     static const float GRID[3] = {246, 150, 210};
@@ -737,7 +731,6 @@ static void draw_jcard(uint32_t now)
            : st->sting_len ? st->sting_pos : 0.35f;
     reel(96, 80, 8.0f + 7.0f * (1.0f - prog), ang);
     reel(144, 80, 8.0f + 7.0f * prog, ang * 1.3f);
-    cv_blit(0, 32);
 }
 
 /* --- PAINTED: an airbrushed sky for each season (tools/paint.py, app/paint.h), dissolving into the next as the
@@ -814,7 +807,34 @@ static void draw_painted(uint32_t now)
         }
     }
     draw_sparks(now);
-    cv_blit(0, 32);
+}
+
+/* the keys' chord, big over the sky for a moment (2.5 s): the root in the big face (capitals), the rest beside it */
+#define CHORD_MS 2500u
+static void draw_chord(uint32_t now)
+{
+    const bl_status_t *st = bl_status();
+    char root[2] = {st->chord_name[0], 0};
+    const char *rest = st->chord_name[0] ? st->chord_name + 1 : "";
+    int32_t w, x, y = 52;
+    uint32_t age;
+    if (st->chord_seq != ui.chord_seq) {
+        ui.chord_seq = st->chord_seq;
+        ui.chord_at = now | 1u;
+    }
+    age = now - ui.chord_at;
+    if (!ui.chord_at || !st->hands || !root[0] || age >= CHORD_MS)
+        return;
+    {
+        float f = age < CHORD_MS - 600u ? 1.0f : (float)(CHORD_MS - age) / 600.0f;   /* it fades the last 0.6 s */
+        uint16_t fg = RGB((int)(255.0f * f), (int)(244.0f * f), (int)(230.0f * f));
+        uint16_t accent = RGB((int)(246.0f * f), (int)(170.0f * f), (int)(140.0f * f));
+        w = text_w(&APP_BIG_FONT, root) + 2 + text_w(&FONT_B, rest);
+        x = (240 - w) / 2;
+        cv_rect(x - 10, y - 6, w + 20, 44, RGB(8, 6, 18));     /* a dark card under it, so it reads on any sky */
+        x = cv_text(x, y, &APP_BIG_FONT, root, fg);
+        cv_text(x + 2, y + 13, &FONT_B, rest, accent);    /* on the root's baseline */
+    }
 }
 
 static void draw_sky(uint32_t now)
@@ -827,6 +847,8 @@ static void draw_sky(uint32_t now)
         draw_jcard(now);
     else
         draw_redwood(now);
+    draw_chord(now);
+    cv_blit(0, 32);
 }
 
 static void time_text(uint32_t s, char *t)
@@ -887,6 +909,8 @@ static void draw_header(uint32_t now)
                 text_cat(t, ":00");
             }
             cv_text(232 - text_w(&FONT_S, t), 8, &FONT_S, t, st->grove == 2 ? RGB(246, 170, 140) : C_WHITE);
+        } else if (st->band) {                   /* PLAY off, the band following the keys */
+            cv_text(232 - text_w(&FONT_XS, "FOLLOWING YOU"), 10, &FONT_XS, "FOLLOWING YOU", C_GRAY);
         } else {
             int_text((int32_t)plat_cpu_pct(), t);
             text_cat(t, "%");
@@ -914,7 +938,7 @@ static void draw_footer(uint32_t now)
     i = 232 - text_w(&FONT_XS, t);
     cv_text(i, 6, &FONT_XS, t, RGB(246, 170, 140));
     {
-        int playing = st->grove || st->sting_len;
+        int playing = st->band || st->sting_len;
         const char *name[4] = {playing ? st->chord_name : 0, bl_season_name(st->season),
                                bl_room_name(bl_par()->room), bl_mode_name(bl_mood_mode(bl_par()->mood))};
         int show[4] = {0, 0, 0, 0}, k;
@@ -979,7 +1003,6 @@ void app_ui_init(void)
             sky_now[i][j] = (float)(i == 0 ? SKY[BS_NSEASONS].top[j] : i == 1 ? SKY[BS_NSEASONS].mid[j]
                                     : i == 2 ? SKY[BS_NSEASONS].low[j] : SKY[BS_NSEASONS].sun[j]);
     ui.turned = -1;
-    ui.steer = -1;
     lcd_fill(0, 0, 240, 240, C_BLACK);
     ui.redraw = 1;
 }
@@ -992,7 +1015,7 @@ void app_frame(void)
     speak();
     if (st->seconds != ui.last_sec || (ui.msg_until && now >= ui.msg_until) ||
         (ui.turned >= 0 && now - ui.turned_at > 600u && now - ui.turned_at < 700u) || st->sting_len ||
-        (ui.btn >> B_HOME & 1u)) {
+        (ui.btn >> B_HOME & 1u) || st->chord_seq != ui.chord_seq) {
         ui.last_sec = st->seconds;
         if (ui.msg_until && now >= ui.msg_until)
             ui.msg_until = 0;
@@ -1023,6 +1046,14 @@ int app_expect(const char *what, int *got)
         *got = bl_par()->mood;
     else if (!strcmp(what, "root"))
         *got = st->root_pc;
+    else if (!strcmp(what, "bass"))
+        *got = st->bass_pc;
+    else if (!strcmp(what, "hands"))
+        *got = st->hands;
+    else if (!strcmp(what, "band"))
+        *got = st->band;
+    else if (!strcmp(what, "chord"))
+        *got = (int)st->chord_pcs;
     else if (!strcmp(what, "solo"))
         *got = bl_par()->solo;
     else if (!strcmp(what, "talk"))
