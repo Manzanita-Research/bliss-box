@@ -72,6 +72,7 @@ static bl_status_t S;
 static uint32_t clk;                 /* samples since bl_init */
 static bl_rng_t rng;                 /* the composer's dice */
 static float now_tone, now_space, now_echo, now_shimmer, now_level, now_vowel, now_bed, now_melody, now_solo;
+static float now_low, now_motion, now_bloom;
 static float lfo[4];                 /* the slow LFOs' phases */
 static float lfo_v[4];               /* and values, -1..1 */
 static float muted = 1.0f, mute_tgt = 1.0f;
@@ -84,8 +85,9 @@ static const char *const VOICE_NAMES[BV_NTYPES] = {"RHODES", "CP-80", "FLUTE", "
 static const char *const MODE_NAMES[BM_NMODES] = {"PENTA", "LYDIAN", "MAJOR", "DORIAN"};
 static const char *const ROOM_NAMES[7] = {"ROOT", "SACRAL", "SOLAR", "HEART", "THROAT", "BROW", "CROWN"};
 static const char *const ROOM_KEYS[7] = {"C", "D", "E", "F", "G", "A", "B"};
-static const char *const SEASON_NAMES[BS_NSEASONS] = {"DAWN", "TEMPLE", "GARDEN", "STARS", "STILL", "RIVER"};
+static const char *const SEASON_NAMES[BS_NSEASONS] = {"DAWN", "TEMPLE", "REDWOODS", "STARS", "STILL", "RIVER"};
 static const char *const PC_NAMES[12] = {"C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"};
+static const char *const PC_SHARP[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
 static const int8_t ROOM_PC[7] = {0, 2, 4, 5, 7, 9, 11};
 
 const char *bl_voice_name(int v) { return v >= 0 && v < BV_NTYPES ? VOICE_NAMES[v] : "?"; }
@@ -149,8 +151,11 @@ static const uint16_t MODE_SET[BM_NMODES] = {
 
 #define PAD_MAX 6
 static struct {
-    int mode, chord;                 /* index in PAL[mode] */
-    uint16_t target;                 /* the chord's pitch classes (absolute) */
+    int mode, chord;                 /* a sting's: index in PAL[mode] */
+    chord_t cur;                     /* the chord now (its root from the tonic) */
+    uint16_t full;                   /* its pitch classes (absolute): what the motion and the melody use */
+    uint16_t target;                 /* the ones the pad holds (a five-note chord leaves its fifth to the others) */
+    int bass_pc;                     /* the low part's note */
     int note[PAD_MAX];
     uint32_t id[PAD_MAX];
     int n;
@@ -171,17 +176,9 @@ static uint16_t chord_set(int mode, int k, int tonic)
         m |= (uint16_t)(1u << pcm(tonic + c->root + c->t[i]));
     return m;
 }
-static int popcount12(uint16_t m)
-{
-    int n = 0;
-    while (m) {
-        n += m & 1;
-        m >>= 1;
-    }
-    return n;
-}
 static int in_scale(int midi) { return (MODE_SET[H.mode] >> pcm(midi - tonic_pc)) & 1; }
-static int in_chord(int midi) { return (H.target >> pcm(midi)) & 1; }
+static int in_chord(int midi) { return (H.full >> pcm(midi)) & 1; }
+static int in_pad(int midi) { return (H.target >> pcm(midi)) & 1; }
 
 static void scopy(char *d, const char *s, int *k, int max)
 {
@@ -189,15 +186,17 @@ static void scopy(char *d, const char *s, int *k, int max)
         d[(*k)++] = *s++;
     d[*k] = 0;
 }
+static int key_sharps(void);
 static void chord_name_update(void)
 {
-    const chord_t *c = chord_def(H.mode, H.chord);
+    const chord_t *c = &H.cur;
+    const char *const *nm = key_sharps() ? PC_SHARP : PC_NAMES;
     int k = 0;
-    scopy(S.chord_name, PC_NAMES[pcm(tonic_pc + c->root)], &k, 16);
+    scopy(S.chord_name, nm[pcm(tonic_pc + c->root)], &k, 16);
     scopy(S.chord_name, c->q, &k, 16);
-    if (c->root) {
+    if (H.bass_pc != pcm(tonic_pc + c->root)) {
         scopy(S.chord_name, "/", &k, 16);
-        scopy(S.chord_name, PC_NAMES[tonic_pc], &k, 16);
+        scopy(S.chord_name, nm[H.bass_pc], &k, 16);
     }
 }
 
@@ -221,20 +220,99 @@ static void ev_note(int note, int type, float vel, int layer)
     S.ev_count++;
 }
 
-/* ---------------------------------------------------------------------------------------- the seasons --- */
+/* ------------------------------------------------------------------------------------------ the moods --- */
+/* A mood is a key and a scale, two or three written progressions, and the voices of the Grove's four parts: the pad
+ * (the chords), the low part (a bass under them), the motion (a ripple, a broken chord, a strum or bell sparks) and
+ * the melody. A progression's chords are given from the key (0 the tonic); a step lasts len harmonic beats (the
+ * mood's chord_s seconds each), and its bass is the chord's root (-1) or a note from the key (0: over the tonic). */
+typedef struct { chord_t c; int8_t bass; uint8_t len; } step_t;
+#define Q_ADD9 "add9", {0, 4, 7, 14}, 4
+#define Q_MAJ7 "maj7", {0, 4, 7, 11}, 4
+#define Q_MAJ9 "maj9", {0, 4, 7, 11, 14}, 5
+#define Q_SIX9 "6/9", {0, 4, 9, 14}, 4
+#define Q_LYD "maj7#11", {0, 4, 7, 11, 18}, 5
+#define Q_MAJ "", {0, 4, 7}, 3
+#define Q_SUS2 "sus2", {0, 2, 7, 12}, 4
+#define Q_SUS4 "7sus", {0, 5, 7, 10}, 4
+#define Q_M7 "m7", {0, 3, 7, 10}, 4
+#define Q_M9 "m9", {0, 3, 7, 10, 14}, 5
+#define Q_M11 "m11", {0, 3, 7, 10, 17}, 5
+#define ST_(root, q, bass, len) {{root, q}, bass, len}
+
+enum { MS_RIPPLE, MS_BROKEN, MS_STRUM, MS_SPARK };   /* how the motion moves */
 typedef struct {
-    uint8_t pad, keys, harp, pedal;
-    float k, h, b, f, pluck;         /* how likely each layer is to speak */
-    float vowel, echo_s, tone;
-} season_t;
-static const season_t SEAS[BS_NSEASONS] = {
-    /* DAWN   */ {BV_STRINGS, BV_RHODES, BV_HARP, BV_GLASS, 0.65f, 0.75f, 0.5f, 0.35f, 0.6f, 0.4f, 0.62f, 0.0f},
-    /* TEMPLE */ {BV_CHOIR, BV_CP80, BV_ZITHER, BV_STRINGS, 0.45f, 0.35f, 1.0f, 0.25f, 0.3f, 0.2f, 0.74f, -0.1f},
-    /* GARDEN */ {BV_STRINGS, BV_RHODES, BV_HARP, BV_GLASS, 0.9f, 0.5f, 0.35f, 0.75f, 0.8f, 0.9f, 0.47f, 0.08f},
-    /* STARS  */ {BV_GLASS, BV_RHODES, BV_ZITHER, BV_GLASS, 0.5f, 1.0f, 0.85f, 0.2f, 0.5f, 1.2f, 0.82f, 0.12f},
-    /* STILL  */ {BV_GLASS, BV_CP80, BV_HARP, BV_STRINGS, 0.25f, 0.2f, 0.3f, 0.15f, 0.25f, 0.6f, 0.7f, -0.15f},
-    /* RIVER  */ {BV_CHOIR, BV_RHODES, BV_HARP, BV_GLASS, 0.7f, 0.65f, 0.4f, 0.9f, 0.7f, 1.6f, 0.55f, 0.0f},
+    uint8_t room, mode;                  /* its own key (a room) and scale */
+    uint8_t pad, pedal, motion, melody;  /* the four parts' voices */
+    uint8_t style;                       /* MS_* */
+    float chord_s;                       /* a harmonic beat, seconds */
+    float ioi;                           /* the motion's pace: seconds a note (a spark's: between them) */
+    float vowel, echo_s, tone;           /* the choir's vowel, the echo's time, a tilt of the tone */
+    const step_t *prog[3];
+    uint8_t plen[3], nprog;
+    float g[4];                          /* the four parts level with each other (tools/render, a part alone) */
+} mood_t;
+
+/* DAWN, D major: strings, a glass bass, the harp rippling, a flute */
+static const step_t DAWN_A[] = {ST_(0, Q_ADD9, -1, 2), ST_(5, Q_MAJ7, -1, 1), ST_(9, Q_M9, -1, 1), ST_(5, Q_SIX9, -1, 1),
+                                ST_(7, Q_SUS4, -1, 1), ST_(0, Q_ADD9, -1, 1), ST_(0, Q_MAJ9, -1, 1)};
+static const step_t DAWN_B[] = {ST_(0, Q_ADD9, -1, 1), ST_(2, Q_MAJ, 0, 1), ST_(0, Q_MAJ7, -1, 1), ST_(2, Q_MAJ, 0, 1),
+                                ST_(5, Q_MAJ9, -1, 1), ST_(4, Q_M7, -1, 1), ST_(2, Q_M9, -1, 1), ST_(7, Q_SUS4, -1, 1)};
+static const step_t DAWN_C[] = {ST_(9, Q_M9, -1, 2), ST_(5, Q_MAJ7, -1, 1), ST_(0, Q_ADD9, -1, 1), ST_(7, Q_SUS2, 0, 1),
+                                ST_(0, Q_SIX9, -1, 2)};
+/* TEMPLE, A dorian: a choir, a string bass, the zither strummed, bells */
+static const step_t TEMPLE_A[] = {ST_(0, Q_M9, -1, 2), ST_(10, Q_ADD9, -1, 1), ST_(5, Q_MAJ, -1, 1), ST_(0, Q_M11, -1, 2),
+                                  ST_(3, Q_MAJ7, -1, 1), ST_(10, Q_SIX9, -1, 1)};
+static const step_t TEMPLE_B[] = {ST_(0, Q_M9, -1, 1), ST_(5, Q_MAJ, 0, 1), ST_(0, Q_M11, -1, 1), ST_(10, Q_ADD9, 0, 1),
+                                  ST_(7, Q_M7, -1, 1), ST_(3, Q_MAJ7, -1, 1), ST_(5, Q_SIX9, -1, 2)};
+/* REDWOODS, F lydian: strings, a glass bass, the CP-80's broken chords, a flute */
+static const step_t REDWOODS_A[] = {ST_(0, Q_LYD, -1, 2), ST_(2, Q_MAJ, 0, 2), ST_(4, Q_M7, -1, 1), ST_(9, Q_M9, -1, 1),
+                                    ST_(7, Q_MAJ7, -1, 1), ST_(2, Q_ADD9, -1, 1)};
+static const step_t REDWOODS_B[] = {ST_(0, Q_MAJ9, -1, 1), ST_(11, Q_M7, -1, 1), ST_(9, Q_M9, -1, 1), ST_(7, Q_SIX9, -1, 1),
+                                    ST_(2, Q_ADD9, 0, 2), ST_(0, Q_LYD, -1, 2)};
+/* STARS, E lydian: glass, a string bass, the Rhodes in broken chords, bells */
+static const step_t STARS_A[] = {ST_(0, Q_MAJ9, -1, 2), ST_(2, Q_ADD9, -1, 2), ST_(9, Q_M9, -1, 1), ST_(7, Q_MAJ7, -1, 1),
+                                 ST_(4, Q_M7, -1, 1), ST_(2, Q_MAJ, 0, 1)};
+static const step_t STARS_B[] = {ST_(0, Q_LYD, -1, 2), ST_(11, Q_M7, -1, 1), ST_(9, Q_M11, -1, 1), ST_(2, Q_SIX9, 0, 2),
+                                 ST_(7, Q_ADD9, -1, 1), ST_(0, Q_MAJ7, -1, 1)};
+/* STILL, G pentatonic: glass, a string bass, a bell now and then, a flute; the slowest */
+static const step_t STILL_A[] = {ST_(0, Q_ADD9, -1, 2), ST_(9, Q_M7, -1, 2), ST_(5, Q_MAJ9, -1, 1), ST_(0, Q_SIX9, -1, 2),
+                                 ST_(7, Q_SUS2, -1, 1)};
+static const step_t STILL_B[] = {ST_(0, Q_SIX9, -1, 2), ST_(2, Q_SUS4, 0, 2), ST_(9, Q_M11, -1, 2), ST_(0, Q_ADD9, -1, 2)};
+/* RIVER, C major: a choir, a glass bass, the harp flowing, a flute; the quickest */
+static const step_t RIVER_A[] = {ST_(5, Q_MAJ7, -1, 1), ST_(7, Q_ADD9, -1, 1), ST_(4, Q_M7, -1, 1), ST_(9, Q_M9, -1, 1),
+                                 ST_(5, Q_MAJ9, -1, 1), ST_(7, Q_SUS4, -1, 1), ST_(0, Q_ADD9, -1, 2)};
+static const step_t RIVER_B[] = {ST_(0, Q_MAJ9, -1, 1), ST_(9, Q_M9, -1, 1), ST_(4, Q_M7, -1, 1), ST_(5, Q_LYD, -1, 1),
+                                 ST_(2, Q_M9, -1, 1), ST_(7, Q_SUS4, -1, 1), ST_(0, Q_SIX9, -1, 2)};
+#define PROGS(a, b) {a, b, 0}, {sizeof a / sizeof a[0], sizeof b / sizeof b[0], 0}, 2
+#define PROGS3(a, b, c) {a, b, c}, {sizeof a / sizeof a[0], sizeof b / sizeof b[0], sizeof c / sizeof c[0]}, 3
+static const mood_t MOODS[BL_NMOODS] = {
+    /* DAWN     */ {1, BM_MAJOR, BV_STRINGS, BV_GLASS, BV_HARP, BV_FLUTE, MS_RIPPLE, 11.0f, 0.34f, 0.4f, 0.62f, 0.0f,
+                    PROGS3(DAWN_A, DAWN_B, DAWN_C), {1.43f, 1.48f, 2.9f, 0.9f}},
+    /* TEMPLE   */ {5, BM_DORIAN, BV_CHOIR, BV_STRINGS, BV_ZITHER, BV_BELLS, MS_STRUM, 13.0f, 0.06f, 0.2f, 0.74f, -0.1f,
+                    PROGS(TEMPLE_A, TEMPLE_B), {0.57f, 2.0f, 1.8f, 3.0f}},
+    /* REDWOODS */ {3, BM_LYDIAN, BV_STRINGS, BV_GLASS, BV_CP80, BV_FLUTE, MS_BROKEN, 12.0f, 0.62f, 0.9f, 0.47f, 0.05f,
+                    PROGS(REDWOODS_A, REDWOODS_B), {1.45f, 1.55f, 2.3f, 0.88f}},
+    /* STARS    */ {2, BM_LYDIAN, BV_GLASS, BV_STRINGS, BV_RHODES, BV_BELLS, MS_BROKEN, 14.0f, 0.55f, 1.2f, 0.82f, 0.12f,
+                    PROGS(STARS_A, STARS_B), {1.19f, 2.1f, 0.85f, 3.0f}},
+    /* STILL    */ {4, BM_PENTA, BV_GLASS, BV_STRINGS, BV_BELLS, BV_FLUTE, MS_SPARK, 20.0f, 2.6f, 0.6f, 0.7f, -0.15f,
+                    PROGS(STILL_A, STILL_B), {1.23f, 1.9f, 1.65f, 1.0f}},
+    /* RIVER    */ {0, BM_MAJOR, BV_CHOIR, BV_GLASS, BV_HARP, BV_FLUTE, MS_RIPPLE, 9.0f, 0.26f, 1.6f, 0.55f, 0.0f,
+                    PROGS(RIVER_A, RIVER_B), {0.44f, 1.53f, 2.5f, 0.86f}},
 };
+int bl_mood_room(int m) { return m >= 0 && m < BL_NMOODS ? MOODS[m].room : 3; }
+int bl_mood_mode(int m) { return m >= 0 && m < BL_NMOODS ? MOODS[m].mode : BM_LYDIAN; }
+int bl_mood_touch(int m) { return m >= 0 && m < BL_NMOODS ? MOODS[m].motion : BV_RHODES; }
+int bl_scale_note(int degree)
+{
+    int m = P.mood >= 0 && P.mood < BL_NMOODS ? P.mood : 0, sc[12], n = 0, k, i, oct;
+    int tonic = 53 + pcm(ROOM_PC[P.room < 0 || P.room > 6 ? 0 : P.room] - 5);
+    for (k = 0; k < 12; k++)
+        if ((MODE_SET[MOODS[m].mode] >> k) & 1)
+            sc[n++] = k;
+    i = degree - 1;
+    oct = i >= 0 ? i / n : -((-i + n - 1) / n);
+    return tonic + sc[i - oct * n] + 12 * oct;
+}
 
 /* --------------------------------------------------------------------------------------- the schedule --- */
 typedef struct {
@@ -249,10 +327,42 @@ static sev_t SQ[NSCHED];
 static struct {
     int on;                          /* 1 playing, 2 closing, 3 released (the tail of a timed piece) */
     uint32_t start;
-    int season;
-    uint32_t next_season, next_keys, next_shower, next_pluck, next_bell, next_flute;
+    int season;                      /* a sting's sky; the Grove's mood */
     int stopping;
+    int mood, room;                  /* what it plays now (P's, at the next chord) */
+    int prog, prog_next, step;       /* the progression, the one after this pass (-1 the same), the step */
+    int sect;                        /* SC_* */
+    uint32_t sect_end;
+    float inten;                     /* 0..1: how much is going on, after the section */
+    uint32_t chord_t0, chord_len;    /* when this chord came, and for how long */
+    int autoplay;                    /* PLAY: it goes on by itself (else it follows the keys, and stops after them) */
+    uint32_t m_next;                 /* the motion */
+    int m_left, m_len, m_idx, m_dir, m_strum;
+    uint32_t mel_next, mel_rest;     /* the melody */
 } G;
+
+/* the keys: what's held, and what they've played lately (the line the melody answers) */
+#define KMAX 10
+#define KLINE 8
+static struct {
+    int8_t note[KMAX];
+    uint32_t on_at[KMAX];
+    int n;                           /* held now */
+    int ever;                        /* a key since bl_init */
+    uint32_t last_on, off_at;        /* the last key down; when the last one came up */
+    int last_note;
+    uint32_t harm_at;                /* when to hear what's held as a chord (the notes of a chord land together) */
+    int dirty;
+    int hands;                       /* the harmony is the keys' */
+    int root_abs;                    /* their chord's root, a pc */
+    float energy;                    /* how hard they play, 0..1, smoothed */
+    int8_t line[KLINE];              /* the line: a press (a chord's top note) each, the newest last */
+    uint32_t line_t[KLINE];
+    int line_n, groups;              /* and the presses since the melody last answered */
+    uint32_t answer_at;
+    uint32_t seq;                    /* one more for each chord they make */
+    float duck, mduck;               /* the band making room: the pad, motion and low part; the melody */
+} K;
 
 static struct {
     int len;                         /* 0 none */
@@ -331,7 +441,7 @@ static int reg_shift(void) { return (int)(lfo_v[3] * 3.5f + 0.5f); }
 
 static void pad_start(int note, float att)
 {
-    int type = SEAS[G.season].pad;
+    int type = MOODS[G.mood].pad;
     voice_t *v;
     float pan = fm_clampf((float)(note - 64) / 18.0f, -0.75f, 0.75f) + rng_range(&rng, -0.2f, 0.2f);
     if (ST.len)
@@ -412,9 +522,9 @@ static int pad_morph(float att, float rel)
     for (k = 0; k < H.n; k++) {
         voice_t *v = voice_by_id(H.id[k]);
         held |= (uint16_t)(1u << pcm(H.note[k]));
-        if (!in_chord(H.note[k]) && (extra < 0 || rng_chance(&rng, 0.5f)))
+        if (!in_pad(H.note[k]) && (extra < 0 || rng_chance(&rng, 0.5f)))
             extra = k;
-        if (v && v->type != SEAS[G.season].pad && !ST.len)
+        if (v && v->type != MOODS[G.mood].pad && !ST.len)
             wrong_type = k;
     }
     for (pc = 0; pc < 12; pc++) {
@@ -451,80 +561,36 @@ static int pad_morph(float att, float rel)
     return 0;
 }
 
-static void pedal_set(int on)
+/* the low part to the bass (att 0: as the moment wants: slow at the start, and in a sting) */
+static void pedal_set(int on, float att)
 {
     voice_t *v = H.pedal_id ? voice_by_id(H.pedal_id) : 0;
-    int note = 36 + tonic_pc, type = ST.len ? H.pedal_type : SEAS[G.season].pedal;
+    int note = 36 + H.bass_pc, type = ST.len ? H.pedal_type : MOODS[G.mood].pedal;
+    if (att <= 0.0f)
+        att = ST.len || !G.on || clk - G.start < SEC(10.0f) ? 6.0f : 2.2f;
     if (note > 43)
         note -= 12;
     if (v && on && v->gate && v->note == note && v->type == type)
         return;
     if (v)
-        voice_release(v, 9.0f);
+        voice_release(v, att > 3.0f ? 9.0f : att < 0.5f ? 1.0f : 4.0f);
     H.pedal_id = 0;
     if (on) {
-        v = voice_start(type, L_PEDAL, note, bl_note_hz(note), 0.5f, 1.0f, 0.0f, 6.0f, 0.0f, -1.0f);
+        v = voice_start(type, L_PEDAL, note, bl_note_hz(note), 0.5f, 1.0f, 0.0f, att, 0.0f, -1.0f);
         H.pedal_id = v->id;
         H.pedal_note = note;
     }
 }
 
+/* a sting's chord: one of the palette's, over the tonic */
 static void chord_set_to(int k)
 {
     H.chord = k;
-    H.target = chord_set(H.mode, k, tonic_pc);
+    H.cur = *chord_def(H.mode, k);
+    H.target = H.full = chord_set(H.mode, k, tonic_pc);
+    H.bass_pc = tonic_pc;
     H.settled = 0;
     chord_name_update();
-}
-
-/* the next chord: a Markov step that keeps at least two notes, leans home */
-static void chord_next(void)
-{
-    int k, n = PAL[H.mode].n, pick = 0;
-    float w[8], tot = 0.0f, u;
-    for (k = 0; k < n; k++) {
-        uint16_t m = chord_set(H.mode, k, tonic_pc);
-        int shared = popcount12((uint16_t)(m & H.target));
-        w[k] = k == H.chord ? 0.0f : shared >= 3 ? 3.0f : shared == 2 ? 1.6f : 0.12f;
-        if (k < PAL[H.mode].home)
-            w[k] *= 1.2f + 1.5f * (1.0f - P.drift);
-        tot += w[k];
-    }
-    u = rng_unit(&rng) * tot;
-    for (k = 0; k < n; k++) {
-        u -= w[k];
-        if (u <= 0.0f) {
-            pick = k;
-            break;
-        }
-    }
-    chord_set_to(pick);
-}
-
-/* drift: a common-tone step to the room a fifth away, and back */
-static void maybe_drift(void)
-{
-    int home = ROOM_PC[P.room], k;
-    if (tonic_pc != home) {
-        if (rng_chance(&rng, 0.55f)) {
-            tonic_pc = home;
-            chord_set_to(0);
-            pedal_set(1);
-        }
-        return;
-    }
-    if (!rng_chance(&rng, P.drift * 0.35f))
-        return;
-    {
-        int cand[2] = {pcm(home + 7), pcm(home + 5)}, c = cand[rng_int(&rng, 2)];
-        for (k = 0; k < 7; k++)
-            if (ROOM_PC[k] == c) {
-                tonic_pc = c;
-                chord_set_to(rng_int(&rng, PAL[H.mode].home));
-                pedal_set(1);
-                return;
-            }
-    }
 }
 
 /* ------------------------------------------------------------------------------------- the melodies --- */
@@ -580,7 +646,7 @@ static void phrase_keys(uint32_t t0, int type, int layer, float vel_s)
         int note = S_[idx];
         float vel = (0.32f + 0.25f * rng_unit(&rng) + (k == 0 ? 0.08f : 0.0f)) * vel_s, hold;
         if (k == len - 1) {                            /* end on the 3rd, the 9th or the 5th */
-            const chord_t *c = chord_def(H.mode, H.chord);
+            const chord_t *c = &H.cur;
             int pick = c->n > 3 && rng_chance(&rng, 0.4f) ? 3 : 1 + rng_int(&rng, 2);
             int pc = pcm(tonic_pc + c->root + c->t[pick < c->n ? pick : 1]);
             int to = nearest_pc(pc, note, 55, 82);
@@ -643,6 +709,39 @@ static void phrase_bell(uint32_t t0, int layer, float vel_s)
     }
 }
 
+/* a bell melody: three to six notes of the scale, stepping, ending on a note of the chord */
+static void phrase_bells(uint32_t t0, int layer, float vel_s)
+{
+    int Sc[32], n = scale_list(Sc, 72, 91), k, idx, len = 3 + rng_int(&rng, 4), dir = rng_chance(&rng, 0.5f) ? 1 : -1;
+    float t = 0.0f;
+    if (n < 5)
+        return;
+    idx = 1 + rng_int(&rng, n - 2);
+    for (k = 0; k < len; k++) {
+        int note = Sc[idx];
+        if (k == len - 1) {
+            int C[32], m = chord_list(C, 72, 91), j, bd = 99;
+            for (j = 0; j < m; j++) {
+                int d = C[j] > note ? C[j] - note : note - C[j];
+                if (d < bd) {
+                    bd = d;
+                    note = C[j];
+                }
+            }
+        }
+        sched(t0 + SEC(t), BV_BELLS, layer, note, (0.3f + 0.15f * rng_unit(&rng) + (k == 0 ? 0.08f : 0.0f)) * vel_s,
+              rng_range(&rng, -0.5f, 0.5f), 6.0f, 0, 0, 0);
+        t += rng_range(&rng, 0.45f, 1.0f) * (k == len - 2 ? 1.5f : 1.0f);
+        if (rng_chance(&rng, 0.2f))
+            dir = -dir;
+        idx += dir * (rng_chance(&rng, 0.75f) ? 1 : 2);
+        if (idx < 0 || idx >= n) {
+            dir = -dir;
+            idx = idx < 0 ? 1 : n - 2;
+        }
+    }
+}
+
 static void phrase_flute(uint32_t t0, int layer, float vel_s)
 {
     int Sc[32], n = scale_list(Sc, 65, 84), C[32], m = chord_list(C, 67, 81), k, idx, tones = 1 + rng_int(&rng, 3), note;
@@ -680,29 +779,315 @@ static void phrase_flute(uint32_t t0, int layer, float vel_s)
 }
 
 /* ------------------------------------------------------------------------------------------ the grove --- */
-static float glen(void) { return (float)P.minutes * 60.0f; }
+/* The Grove plays the mood's progressions, all four parts at once: the pad's chord arrives together (common tones
+ * held, the rest crossfaded), the low part moves to the step's bass, the motion runs through the chord as it is
+ * now, the melody answers a chord now and then. Over a piece it has a shape: it arrives (the pad and the bass, then
+ * the motion), blooms (everyone, the sounds open), floats (thinner, darker, the chords slower), and blooms again;
+ * a timed piece returns home before it ends. Each pass through a progression strays a little (drift): a chord's
+ * colour changes, or the next pass is another of the mood's progressions. */
+enum { SC_ARRIVE, SC_BLOOM, SC_FLOAT, SC_RETURN };
+static const float SECT_INTEN[4] = {0.3f, 1.0f, 0.55f, 0.5f};
 
-static void grove_start(void)
+static float glen(void) { return (float)P.minutes * 60.0f; }
+static const mood_t *mo(void) { return &MOODS[G.mood]; }
+/* spell the chords in sharps when the key's signature has them (E lydian is B major's notes: C#m7, not Dbm7) */
+static int key_sharps(void)
+{
+    static const int PARENT[BM_NMODES] = {0, 7, 0, 10};      /* the major scale each mode borrows its notes from */
+    int p = pcm(tonic_pc + PARENT[mo()->mode]);
+    return p == 7 || p == 2 || p == 9 || p == 4 || p == 11 || p == 6;
+}
+
+static int chord_in_scale(const chord_t *c)
+{
+    int i;
+    for (i = 0; i < c->n; i++)
+        if (!((MODE_SET[H.mode] >> pcm(c->root + c->t[i])) & 1))
+            return 0;
+    return 1;
+}
+
+/* a step's chord, sometimes in another colour of the same kind that stays in the scale */
+static void step_colour(chord_t *c)
+{
+    static const chord_t MAJ[] = {{0, Q_ADD9}, {0, Q_MAJ7}, {0, Q_SIX9}, {0, Q_MAJ9}};
+    static const chord_t MIN[] = {{0, Q_M7}, {0, Q_M9}, {0, Q_M11}};
+    const chord_t *set;
+    int n, k;
+    if (c->n < 3 || !rng_chance(&rng, 0.1f + 0.4f * P.drift))
+        return;
+    if (c->t[1] == 4) {
+        set = MAJ;
+        n = 4;
+    } else if (c->t[1] == 3) {
+        set = MIN;
+        n = 3;
+    } else
+        return;
+    for (k = 0; k < 3; k++) {
+        chord_t t = set[rng_int(&rng, n)];
+        t.root = c->root;
+        if (chord_in_scale(&t)) {
+            *c = t;
+            return;
+        }
+    }
+}
+
+/* the step's length in samples: the mood's beat, slower when the activity is low and while it floats */
+static uint32_t step_len(int len)
+{
+    float s = mo()->chord_s * (float)len * (1.3f - 0.6f * P.activity) * (G.sect == SC_FLOAT ? 1.25f : 1.0f);
+    return SEC(s * rng_range(&rng, 0.9f, 1.12f));
+}
+
+/* a new chord, now: the pad's voices all move at once (att: how slowly the new ones come in) */
+static void chord_go(const chord_t *c, int bass, uint32_t len, float att)
 {
     int k;
+    H.cur = *c;
+    H.bass_pc = pcm(tonic_pc + (bass < 0 ? c->root : bass));
+    H.full = 0;
+    for (k = 0; k < c->n; k++)
+        H.full |= (uint16_t)(1u << pcm(tonic_pc + c->root + c->t[k]));
+    H.target = H.full;
+    if (c->n > 4)                                       /* five notes: the pad leaves the fifth to the others */
+        H.target &= (uint16_t)~(1u << pcm(tonic_pc + c->root + c->t[2]));
+    H.settled = 0;
+    chord_name_update();
+    for (k = 0; k < 8; k++)
+        if (!pad_morph(att * rng_range(&rng, 0.8f, 1.25f), rng_range(&rng, 3.5f, 5.5f)))
+            break;
+    pedal_set(1, 0.0f);
+    G.chord_t0 = clk;
+    G.chord_len = len;
+    H.next_chord = clk + len;
+    H.next_morph = clk + SEC(2.0f);
+    if (mo()->style == MS_STRUM && G.sect != SC_ARRIVE) {
+        G.m_next = clk + SEC(rng_range(&rng, 0.3f, 1.2f));
+        G.m_left = 0;
+        G.m_strum = 2;
+    }
+    if (due(G.mel_rest))                                /* the melody answers a new chord, sometimes */
+        G.mel_next = clk + SEC(rng_range(&rng, 1.5f, 4.0f));
+}
+
+static void step_go(float att)
+{
+    const step_t *s = &mo()->prog[G.prog][G.step];
+    chord_t c = s->c;
+    step_colour(&c);
+    chord_go(&c, s->bass, step_len(s->len), att);
+}
+
+/* a chord on d (from the tonic) made of the scale: its third, its fifth and its ninth (the octave when the ninth
+ * isn't in it); in a pentatonic scale they stack in fourths. Outside the scale a major add9 */
+static void chord_build(chord_t *c, int d)
+{
+    static const chord_t ADD9 = {0, Q_ADD9};
+    int sc[12], n = 0, i = -1, k;
+    for (k = 0; k < 12; k++)
+        if ((MODE_SET[H.mode] >> k) & 1) {
+            if (k == d)
+                i = n;
+            sc[n++] = k;
+        }
+    *c = ADD9;
+    c->root = (int8_t)d;
+    if (i < 0)
+        return;
+    for (k = 0; k < 3; k++) {
+        int j = i + 2 * k;
+        c->t[k] = (int8_t)(sc[j % n] + 12 * (j / n) - d);
+    }
+    c->t[3] = (MODE_SET[H.mode] >> pcm(d + 2)) & 1 ? 14 : 12;
+    c->q = c->t[1] == 3 ? (c->t[3] == 14 ? "madd9" : "m") : c->t[1] == 4 ? (c->t[3] == 14 ? "add9" : "") : "sus";
+}
+
+/* a chord on one note (pc): the progression's own on it, if it has one (and it goes on from there), else the
+ * mood's other progression's, else one built in the scale: root, third, fifth and ninth (a major add9 on a note
+ * outside it: the borrowed chords, bVII and bVI, that new age loves) */
+static int chord_on(int pc, chord_t *c)
+{
+    const mood_t *m = mo();
+    int d = pcm(pc - tonic_pc), p, k;
+    for (p = 0; p < m->nprog; p++) {
+        int q = (G.prog + p) % m->nprog;
+        for (k = 0; k < m->plen[q]; k++)
+            if (pcm(m->prog[q][k].c.root) == d) {
+                *c = m->prog[q][k].c;
+                return m->prog[q][k].len;
+            }
+    }
+    chord_build(c, d);
+    return 1;
+}
+
+/* what the held notes are, as a chord: each held note tried as the root against the qualities below, the best fit
+ * (two for each of its notes held, three off for each it needs that isn't, two off for each held note it hasn't,
+ * one more on the bass, one off for a note it would add outside the scale). Then filled out: a bare fifth gets the
+ * scale's third, a triad the ninth when the scale has it. Returns the extra held notes it doesn't name (a mask). */
+typedef struct { const char *q; int8_t t[5]; int8_t n; } qual_t;
+static const qual_t QUAL[] = {
+    {"", {0, 4, 7}, 3},          {"m", {0, 3, 7}, 3},          {"sus2", {0, 2, 7}, 3},       {"sus4", {0, 5, 7}, 3},
+    {"5", {0, 7}, 2},            {"add9", {0, 4, 7, 14}, 4},   {"madd9", {0, 3, 7, 14}, 4},  {"maj7", {0, 4, 7, 11}, 4},
+    {"m7", {0, 3, 7, 10}, 4},    {"7", {0, 4, 7, 10}, 4},      {"6", {0, 4, 7, 9}, 4},       {"m6", {0, 3, 7, 9}, 4},
+    {"7sus", {0, 5, 7, 10}, 4},  {"dim", {0, 3, 6}, 3},        {"aug", {0, 4, 8}, 3},        {"m7b5", {0, 3, 6, 10}, 4},
+    {"6/9", {0, 4, 7, 9, 14}, 5}, {"maj9", {0, 4, 7, 11, 14}, 5}, {"m9", {0, 3, 7, 10, 14}, 5},
+    {"maj7#11", {0, 4, 7, 11, 18}, 5}, {"m11", {0, 3, 7, 10, 17}, 5},
+};
+#define NQUAL ((int)(sizeof QUAL / sizeof QUAL[0]))
+
+static int popc(uint32_t x)
+{
+    int n = 0;
+    for (; x; x &= x - 1)
+        n++;
+    return n;
+}
+static uint16_t qual_mask(const qual_t *q, int r)
+{
+    uint16_t m = 0;
+    int i;
+    for (i = 0; i < q->n; i++)
+        m |= (uint16_t)(1u << pcm(r + q->t[i]));
+    return m;
+}
+static uint16_t scale_abs(void)
+{
+    uint16_t m = 0;
+    int k;
+    for (k = 0; k < 12; k++)
+        if (in_scale(k))
+            m |= (uint16_t)(1u << k);
+    return m;
+}
+
+static uint16_t chord_match(uint16_t held, int bass, chord_t *c)
+{
+    uint16_t sc = scale_abs(), tm;
+    int r, q, best_r = bass, best_q = 4, bs = -99;
+    for (r = 0; r < 12; r++) {
+        if (!((held >> r) & 1))
+            continue;
+        for (q = 0; q < NQUAL; q++) {
+            int sco;
+            tm = qual_mask(&QUAL[q], r);
+            sco = 2 * popc(tm & held) - 3 * popc(tm & ~held) - 2 * popc(held & ~tm) + (r == bass) - popc(tm & ~held & ~sc) -
+                  (QUAL[q].n == 2);                     /* a bare fifth: only when it's all there is */
+            if (sco > bs) {
+                bs = sco;
+                best_r = r;
+                best_q = q;
+            }
+        }
+    }
+    if (QUAL[best_q].t[1] == 7)                          /* a bare fifth: the scale's third */
+        chord_build(c, pcm(best_r - tonic_pc));
+    else {
+        q = best_q;
+        if ((q == 0 || q == 1) && ((sc >> pcm(best_r + 2)) & 1))   /* a triad: its ninth */
+            q += 5;
+        c->root = (int8_t)pcm(best_r - tonic_pc);
+        c->q = QUAL[q].q;
+        for (r = 0; r < 5; r++)
+            c->t[r] = QUAL[q].t[r];
+        c->n = QUAL[q].n;
+    }
+    tm = 0;
+    for (r = 0; r < c->n; r++)
+        tm |= (uint16_t)(1u << pcm(tonic_pc + c->root + c->t[r]));
+    return held & (uint16_t)~tm;
+}
+
+/* the keys' chord, now: the pad's voices all move at once and quickly, the low part to the bass in a moment, and
+ * the motion runs through it within a beat */
+static void hands_go(const chord_t *c, int bass_pc, uint16_t extra)
+{
+    int k;
+    H.cur = *c;
+    H.bass_pc = bass_pc;
+    H.full = 0;
+    for (k = 0; k < c->n; k++)
+        H.full |= (uint16_t)(1u << pcm(tonic_pc + c->root + c->t[k]));
+    H.target = H.full;
+    if (c->n > 4)
+        H.target &= (uint16_t)~(1u << pcm(tonic_pc + c->root + c->t[2]));
+    H.full |= extra;
+    H.settled = 0;
+    chord_name_update();
+    for (k = 0; k < 8; k++)
+        if (!pad_morph(0.3f * rng_range(&rng, 0.8f, 1.15f), rng_range(&rng, 1.2f, 2.0f)))
+            break;
+    pedal_set(1, 0.12f);
+    G.chord_t0 = clk;
+    G.chord_len = SEC(10.0f);
+    H.next_chord = clk + SEC(2.0f);
+    H.next_morph = clk + SEC(1.0f);
+    G.m_left = 0;
+    G.m_next = clk + SEC(0.15f);
+    G.m_strum = 2;
+    K.hands = 1;
+    K.root_abs = pcm(tonic_pc + c->root);
+    K.seq++;
+}
+
+static void section_next(void)
+{
+    float el = (float)(clk - G.start) * BL_INV_SR, L = glen();
+    int s = G.sect == SC_BLOOM ? SC_FLOAT : SC_BLOOM;
+    if (s == SC_BLOOM && mo()->nprog > 1 && rng_chance(&rng, 0.35f + 0.5f * P.drift))
+        G.prog_next = (G.prog + 1 + rng_int(&rng, mo()->nprog - 1)) % mo()->nprog;   /* after this pass */
+    G.sect = s;
+    G.sect_end = clk + SEC(s == SC_BLOOM ? rng_range(&rng, 120.0f, 200.0f) : rng_range(&rng, 80.0f, 140.0f));
+    if (L > 240.0f && el + (float)(G.sect_end - clk) * BL_INV_SR > L - 100.0f) {   /* the last: home */
+        G.sect = SC_RETURN;
+        G.prog_next = 0;
+        G.sect_end = clk + SEC(1e5f);
+    }
+}
+
+static void hard_stop(void);
+
+/* the band: by itself (PLAY: it arrives, slowly, and goes through the mood's progressions), or for the keys (it
+ * blooms at once, and waits on them) */
+static void grove_start(int autoplay)
+{
+    if (ST.len) {
+        hard_stop();
+        ST.len = 0;
+    }
+    muted = mute_tgt = 1.0f;
     G.on = 1;
+    G.autoplay = autoplay;
     G.start = clk;
     G.stopping = 0;
-    H.mode = P.mode;
+    G.mood = P.mood;
+    G.season = G.mood;
+    H.mode = mo()->mode;
     tonic_pc = ROOM_PC[P.room];
-    G.season = rng_chance(&rng, 0.5f) ? BS_DAWN : (rng_chance(&rng, 0.5f) ? BS_STARS : BS_TEMPLE);
-    G.next_season = clk + SEC(rng_range(&rng, 150.0f, 330.0f));
-    chord_set_to(rng_int(&rng, PAL[H.mode].home));
-    pedal_set(1);
-    for (k = 0; k < 4; k++)                            /* the first chord comes in together, staggered */
-        pad_morph(rng_range(&rng, 4.0f, 7.0f), 6.0f);
-    H.next_morph = clk + SEC(2.0f);
-    H.next_chord = clk + SEC(rng_range(&rng, 30.0f, 60.0f));
-    G.next_keys = clk + SEC(rng_range(&rng, 9.0f, 16.0f));
-    G.next_pluck = clk + SEC(rng_range(&rng, 14.0f, 22.0f));
-    G.next_bell = clk + SEC(rng_range(&rng, 20.0f, 32.0f));
-    G.next_shower = clk + SEC(rng_range(&rng, 30.0f, 60.0f));
-    G.next_flute = clk + SEC(rng_range(&rng, 45.0f, 80.0f));
+    G.room = P.room;
+    G.prog = 0;
+    G.prog_next = -1;
+    G.step = 0;
+    G.m_left = 0;
+    G.m_strum = 0;
+    if (!autoplay) {                                    /* the keys' chord comes next (hands_go) */
+        G.sect = SC_BLOOM;
+        G.sect_end = clk + SEC(1e5f);
+        G.inten = 0.6f;
+        G.m_next = clk + SEC(0.15f);
+        G.mel_next = clk + SEC(30.0f);
+        G.mel_rest = clk;
+        return;
+    }
+    G.sect = SC_ARRIVE;
+    G.sect_end = clk + SEC(rng_range(&rng, 40.0f, 70.0f));
+    G.inten = 0.15f;
+    G.m_next = clk + SEC(rng_range(&rng, 10.0f, 18.0f));
+    G.mel_next = clk + SEC(rng_range(&rng, 25.0f, 40.0f));
+    G.mel_rest = clk + SEC(40.0f);
+    step_go(rng_range(&rng, 4.0f, 7.0f));
 }
 
 static void release_all(float rel, int keep_solo)
@@ -719,32 +1104,163 @@ static void grove_stop(float rel)
 {
     int i;
     G.on = 0;
+    G.autoplay = 0;
+    K.hands = 0;
     for (i = 0; i < L_SOLO; i++)
         sched_clear(i);
     release_all(rel, 1);
 }
 
+/* where the keys have been playing: what's held, and the line's last few seconds; 0 when nowhere */
+static int keys_span(int *lo, int *hi)
+{
+    int k, n = 0;
+    *lo = 127;
+    *hi = 0;
+    for (k = 0; k < K.n; k++, n++) {
+        if (K.note[k] < *lo)
+            *lo = K.note[k];
+        if (K.note[k] > *hi)
+            *hi = K.note[k];
+    }
+    for (k = 0; k < K.line_n; k++)
+        if (clk - K.line_t[k] < SEC(8.0f)) {
+            n++;
+            if (K.line[k] < *lo)
+                *lo = K.line[k];
+            if (K.line[k] > *hi)
+                *hi = K.line[k];
+        }
+    return n;
+}
+
+/* the motion: one note when it is due, from the chord as it is now (a chord change never leaves it behind); while
+ * the keys lead, out of their way (above them, or under them when they play high) and as busy as they play hard */
+static void motion_step(void)
+{
+    const mood_t *m = mo();
+    float in = (K.hands ? fm_maxf(G.inten, K.energy) : G.inten) * (0.45f + 0.55f * P.activity) * (P.talk ? 0.7f : 1.0f);
+    float ioi = m->ioi;
+    int C[32], n, note, lo, hi, klo, khi;
+    if (!due(G.m_next))
+        return;
+    if (G.m_left <= 0) {                                /* a phrase, or a rest */
+        float go = G.m_strum == 2 ? 1.0f : G.m_strum ? 0.3f + 0.7f * in : 0.25f + 0.7f * in;
+        G.m_strum = 0;
+        if (!rng_chance(&rng, go)) {
+            G.m_next = clk + SEC(m->style == MS_SPARK ? ioi * rng_range(&rng, 1.0f, 2.0f) : rng_range(&rng, 2.0f, 5.0f));
+            return;
+        }
+        G.m_left = m->style == MS_RIPPLE ? 8 + rng_int(&rng, 4 + (int)(10.0f * in)) : m->style == MS_BROKEN ? 4 + rng_int(&rng, 3)
+                   : m->style == MS_STRUM ? 5 + rng_int(&rng, 3) : 1 + rng_chance(&rng, 0.35f);
+        G.m_dir = m->style == MS_STRUM || rng_chance(&rng, 0.6f) ? 1 : -1;
+        G.m_idx = -1;
+        G.m_len = G.m_left;
+    }
+    switch (m->style) {
+    case MS_RIPPLE: lo = 55 + reg_shift(); hi = 88 + reg_shift(); break;
+    case MS_BROKEN: lo = 48; hi = 77; break;
+    case MS_STRUM: lo = 50; hi = 79; break;
+    default: lo = 76; hi = 93; break;
+    }
+    if (K.hands && keys_span(&klo, &khi)) {
+        if (klo + khi < 136) {                          /* the hands low or in the middle: above them */
+            lo = khi + 3 < 67 ? 67 : khi + 3;
+            hi = lo + 24 > 98 ? 98 : lo + 24;
+        } else {                                        /* high: under them */
+            hi = klo - 3;
+            lo = hi - 24 < 45 ? 45 : hi - 24;
+            if (m->style == MS_SPARK && lo < 64)
+                lo = 64;
+        }
+    }
+    n = chord_list(C, lo, hi);
+    if (n < 3) {
+        G.m_left = 0;
+        return;
+    }
+    if (G.m_idx < 0)                                    /* where a phrase starts: low for a ripple going up */
+        G.m_idx = m->style == MS_SPARK ? rng_int(&rng, n) : G.m_dir > 0 ? rng_int(&rng, n / 3 + 1) : n - 1 - rng_int(&rng, n / 3 + 1);
+    if (G.m_idx >= n)
+        G.m_idx = n - 1;
+    note = C[G.m_idx];
+    {
+        float x = (float)(G.m_len - G.m_left) / (float)(G.m_len > 1 ? G.m_len - 1 : 1);
+        float vel = (m->style == MS_SPARK ? 0.28f : 0.24f) + 0.14f * sin1(x * 0.5f) + 0.06f * rng_unit(&rng);
+        float hold = m->style == MS_RIPPLE ? 1.6f : m->style == MS_BROKEN ? 1.5f : m->style == MS_STRUM ? 3.0f : 4.0f;
+        sched(clk, m->motion, L_HARP, note, vel * (0.8f + 0.3f * in), fm_clampf((float)(note - 70) / 16.0f, -0.7f, 0.7f),
+              hold, 0, 0, 0);
+    }
+    G.m_left--;
+    if (m->style == MS_SPARK) {
+        G.m_idx = G.m_idx + (rng_chance(&rng, 0.5f) ? 1 : -1);
+        G.m_next = clk + SEC(G.m_left ? rng_range(&rng, 0.4f, 0.9f) : ioi * rng_range(&rng, 0.7f, 1.6f));
+        return;
+    }
+    G.m_idx += G.m_dir;
+    if (m->style == MS_RIPPLE && (G.m_idx >= n || G.m_idx < 0)) {   /* the top, or the bottom: turn */
+        G.m_dir = -G.m_dir;
+        G.m_idx += 2 * G.m_dir;
+    }
+    if (G.m_idx < 0)
+        G.m_idx = 0;
+    if (G.m_left) {
+        G.m_next = clk + SEC(ioi * rng_around(&rng, 1.0f, m->style == MS_BROKEN ? 0.25f : 0.06f));
+    } else if (m->style == MS_STRUM) {                  /* the next strum: halfway through the chord */
+        uint32_t half = G.chord_t0 + G.chord_len / 2;
+        if ((int32_t)(half - clk) > (int32_t)SEC(2.0f)) {
+            G.m_next = half;
+            G.m_strum = 1;
+        } else {                                        /* the next chord strums it (chord_go) */
+            G.m_next = H.next_chord + SEC(4.0f);
+            G.m_strum = 0;
+        }
+    } else
+        G.m_next = clk + SEC(ioi * rng_range(&rng, 3.0f, 9.0f) / (0.4f + in));
+}
+
+static void melody_step(void)
+{
+    const mood_t *m = mo();
+    float in = G.inten * (P.talk ? 0.6f : 1.0f);
+    if (K.hands || !due(G.mel_next) || !due(G.mel_rest))   /* the keys have the tune (and an answer) */
+        return;
+    G.mel_next = clk + SEC(rng_range(&rng, 30.0f, 70.0f));      /* (a chord change brings it sooner) */
+    if (G.sect == SC_ARRIVE || !rng_chance(&rng, (0.2f + 0.6f * in) * (0.5f + 0.5f * P.activity)))
+        return;
+    if (m->melody == BV_FLUTE) {                       /* a flute phrase is up to 20 s: then a breath */
+        phrase_flute(clk, L_FLUTE, 0.9f);
+        G.mel_rest = clk + SEC(rng_range(&rng, 16.0f, 30.0f) * rest_scale());
+    } else {
+        phrase_bells(clk, L_BELL, 0.9f);
+        if (rng_chance(&rng, 0.4f))                    /* and its answer */
+            phrase_bells(clk + SEC(rng_range(&rng, 4.5f, 7.0f)), L_BELL, 0.75f);
+        G.mel_rest = clk + SEC(rng_range(&rng, 6.0f, 14.0f) * rest_scale());
+    }
+}
+
 static void grove_step(void)
 {
     float el = (float)(clk - G.start) * BL_INV_SR, L = glen();
-    const season_t *se = &SEAS[G.season];
-    float rs = rest_scale();
     S.seconds = (uint32_t)el;
     if (G.on == 3) {                                   /* the tail of a timed piece */
         if (el >= L)
             G.on = 0;
         return;
     }
-    /* the ending of a timed piece: home, add9, everything lets go 25 s before the end */
-    if (L > 90.0f && el >= L - 60.0f && G.on == 1) {
+    {                                                  /* the intensity follows the section (about 15 s) */
+        float t = G.autoplay ? SECT_INTEN[G.sect] : 0.6f;
+        G.inten += (t - G.inten) * 0.0004f;
+    }
+    /* the ending of a timed piece: home, everything lets go 25 s before the end */
+    if (G.autoplay && L > 90.0f && el >= L - 60.0f && G.on == 1) {
+        const step_t *s = &mo()->prog[0][0];
         G.on = 2;
-        if (tonic_pc != ROOM_PC[P.room]) {
-            tonic_pc = ROOM_PC[P.room];
-            pedal_set(1);
-        }
-        chord_set_to(0);
-        H.next_morph = clk;
-        phrase_shower(clk + SEC(14.0f), se->harp, L_HARP, 0.8f, 10);
+        tonic_pc = ROOM_PC[P.room];
+        G.prog = 0;
+        G.step = 0;
+        chord_go(&s->c, s->bass, SEC(60.0f), 3.0f);
+        phrase_shower(clk + SEC(14.0f), mo()->motion == BV_ZITHER ? BV_ZITHER : BV_HARP, L_HARP, 0.8f, 10);
         phrase_bell(clk + SEC(26.0f), L_BELL, 0.9f);
     }
     if (G.on == 2 && el >= L - 25.0f) {
@@ -754,66 +1270,68 @@ static void grove_step(void)
         release_all(16.0f, 1);
         return;
     }
-    if (G.on == 1 && due(G.next_season)) {
-        int s;
-        do
-            s = rng_int(&rng, BS_NSEASONS);
-        while (s == G.season || (s == BS_STILL && rng_chance(&rng, 0.5f)));
-        G.season = s;
-        se = &SEAS[s];
-        G.next_season = clk + SEC(rng_range(&rng, 150.0f, 330.0f));
-        H.next_morph = clk + SEC(1.0f);
-        H.settled = 0;
-        pedal_set(1);
+    if (G.on == 1 && G.autoplay && due(G.sect_end)) {
+        if (G.sect == SC_ARRIVE)
+            G.m_next = clk;
+        section_next();
     }
-    /* the pad: one voice at a time while it moves, then a dwell */
-    if (due(H.next_morph)) {
-        int moving = pad_morph(G.on == 2 ? 3.0f : rng_range(&rng, 3.0f, 6.0f), rng_range(&rng, 5.0f, 8.0f));
-        H.next_morph = clk + SEC(moving ? rng_range(&rng, 4.0f, 10.0f) : 2.0f);
-        if (!moving && !H.settled) {
-            H.settled = 1;
-            H.next_chord = clk + SEC(rng_range(&rng, 20.0f, 70.0f) * (1.4f - 0.6f * P.activity));
+    /* the pad mends itself (a stolen voice, a new mood's colour) one voice at a time */
+    if (due(H.next_morph))
+        H.next_morph = clk + SEC(pad_morph(rng_range(&rng, 2.0f, 4.0f), rng_range(&rng, 4.0f, 6.0f)) ? 3.0f : 2.0f);
+    if (K.hands && (G.mood != P.mood || G.room != P.room)) {   /* the keys' chord: another mood (the pad mends
+                                                                * to its colour), another key (the same chord) */
+        if (G.mood != P.mood) {
+            G.mood = P.mood;
+            G.season = G.mood;
+            H.mode = mo()->mode;
+            G.prog = 0;
+            G.step = 0;
+            G.prog_next = -1;
         }
-    }
-    if (G.on == 1 && H.settled && due(H.next_chord)) {
-        if (rng_chance(&rng, 0.3f))
-            maybe_drift();
-        if (H.settled)
-            chord_next();
+        G.room = P.room;
+        tonic_pc = ROOM_PC[P.room];
+        H.cur.root = (int8_t)pcm(K.root_abs - tonic_pc);
         H.next_morph = clk;
+    }
+    if (G.on == 1 && due(H.next_chord)) {
+        if (K.hands)                                   /* the keys' chord stays */
+            H.next_chord = clk + SEC(2.0f);
+        else {
+            int moved = 0;
+            if (G.mood != P.mood) {                    /* another mood: its key, its first progression */
+                G.mood = P.mood;
+                G.season = G.mood;
+                H.mode = mo()->mode;
+                G.prog = 0;
+                G.step = 0;
+                G.prog_next = -1;
+                moved = 1;
+            }
+            if (G.room != P.room) {                    /* another key */
+                G.room = P.room;
+                tonic_pc = ROOM_PC[P.room];
+                if (!moved)
+                    G.step = 0;
+                moved = 1;
+            }
+            if (!moved && ++G.step >= mo()->plen[G.prog]) {
+                G.step = 0;
+                if (G.prog_next >= 0) {
+                    G.prog = G.prog_next;
+                    G.prog_next = -1;
+                }
+            }
+            step_go(moved ? 3.0f : rng_range(&rng, 1.2f, 2.6f));
+        }
     }
     if (G.on != 1)
         return;
-    /* the melodic layers */
-    if (due(G.next_keys)) {
-        if (rng_chance(&rng, se->k))
-            phrase_keys(clk, se->keys, L_KEYS, 1.0f);
-        G.next_keys = clk + SEC(rng_range(&rng, 5.0f, 22.0f) * rs + 3.0f);
-    }
-    if (due(G.next_shower)) {
-        if (rng_chance(&rng, se->h))
-            phrase_shower(clk, se->harp, L_HARP, 0.9f, 6 + rng_int(&rng, 9));
-        G.next_shower = clk + SEC(rng_range(&rng, 45.0f, 150.0f) * rs);
-    }
-    if (due(G.next_pluck)) {
-        if (rng_chance(&rng, se->pluck)) {
-            int C[32], n = chord_list(C, 64, 84);
-            if (n)
-                sched(clk, se->harp, L_PLUCK, C[rng_int(&rng, n)], 0.3f + 0.2f * rng_unit(&rng),
-                      rng_range(&rng, -0.7f, 0.7f), 6.0f, 0, 0, 0);
-        }
-        G.next_pluck = clk + SEC(rng_range(&rng, 8.0f, 25.0f) * rs);
-    }
-    if (due(G.next_bell)) {
-        if (rng_chance(&rng, se->b))
-            phrase_bell(clk, L_BELL, 1.0f);
-        G.next_bell = clk + SEC(rng_range(&rng, 14.0f, 45.0f) * rs);
-    }
-    if (due(G.next_flute)) {
-        if (rng_chance(&rng, se->f))
-            phrase_flute(clk, L_FLUTE, 1.0f);
-        G.next_flute = clk + SEC(rng_range(&rng, 25.0f, 90.0f) * rs);
-    }
+    if (!K.hands && (G.mood != P.mood || G.room != P.room))   /* a new mood or key: at the next chord, soon */
+        if ((int32_t)(H.next_chord - clk) > (int32_t)SEC(3.0f))
+            H.next_chord = clk + SEC(1.5f);
+    if (G.sect != SC_ARRIVE || el > 12.0f)
+        motion_step();
+    melody_step();
 }
 
 /* ------------------------------------------------------------------------------------------ the sting --- */
@@ -841,6 +1359,9 @@ static void hard_stop(void)
     H.n = 0;
     H.pedal_id = 0;
     G.on = 0;
+    G.autoplay = 0;
+    K.hands = 0;
+    K.dirty = 0;
 }
 
 static void sting_start(int secs, uint32_t seed)
@@ -867,8 +1388,11 @@ static void sting_start(int secs, uint32_t seed)
     now_level = P.level;
     now_bed = P.bed;
     now_melody = P.melody;
+    now_low = P.low;
+    now_motion = P.motion;
+    now_bloom = 0.55f;
     EC.time = fm_clampf(L * 0.12f, 0.25f, 0.62f);
-    H.mode = P.mode;
+    H.mode = MOODS[P.mood].mode;
     tonic_pc = ROOM_PC[P.room];
     home = rng_int(&rng, PAL[H.mode].home);
     chord_set_to(home);
@@ -891,7 +1415,7 @@ static void sting_start(int secs, uint32_t seed)
             pad_morph(att, 0.0f);
     }
     if (g == GS_GROVE || g == GS_BREATH)
-        pedal_set(1);
+        pedal_set(1, 0.0f);
     t = 0.05f;
     switch (g) {
     case GS_SHIMMER:
@@ -989,11 +1513,12 @@ static void shed_run(void)
     /* more voices than the CPU can render: the quietest let go, a quiet one at once, else in 20 ms.
      * And on an overrun (app_overload, bl_shed) one more, held or not, save a played solo key. */
     while (cost > BL_VOICE_BUDGET || shed_req != done) {
-        int best = -1, forced = shed_req != done;
+        int best = -1, forced = shed_req != done, pass;
         float lowest = 1e9f;
+        for (pass = 0; pass < 2 && best < 0; pass++)   /* released voices first; then, still over, a held one */
         for (i = 0; i < NVOICES; i++) {
             float lv;
-            if (!V[i].on || V[i].hold == -2.0f || (V[i].layer == L_SOLO && V[i].gate) || (V[i].gate && !forced))
+            if (!V[i].on || V[i].hold == -2.0f || (V[i].layer == L_SOLO && V[i].gate) || (V[i].gate && !forced && !pass))
                 continue;
             lv = V[i].env * V[i].dec * (V[i].gate ? 4.0f : 1.0f) * V[i].gain;
             if (lv < lowest) {
@@ -1015,13 +1540,14 @@ static void shed_run(void)
 /* the voices level with each other as solos (loudest 400 ms of tools/render.c's solo phrase within a dB or so:
  * -14 for the keys and plucks, -15.5 for the pads): the bed keeps its own balance */
 static const float SOLO_TRIM[BV_NTYPES] = {
-    0.89f, /* rhodes */ 1.78f, /* cp80 */ 1.0f, /* flute */ 1.78f, /* harp */ 1.11f, /* zither */
-    1.10f, /* bells */ 1.78f, /* strings */ 0.65f, /* choir */ 1.97f /* glass */
+    0.66f, /* rhodes */ 1.55f, /* cp80 */ 1.19f, /* flute */ 2.24f, /* harp */ 1.33f, /* zither */
+    1.46f, /* bells */ 1.78f, /* strings */ 0.65f, /* choir */ 1.97f /* glass */
 };
 
 static void solo_note(int midi, float vel)
 {
     int i, t = P.solo;
+    float g;
     if (vel <= 0.0f) {
         for (i = 0; i < NVOICES; i++)
             if (V[i].on && V[i].gate && V[i].layer == L_SOLO && V[i].note == midi)
@@ -1038,9 +1564,237 @@ static void solo_note(int midi, float vel)
                 ev_note(midi, t, vel, L_SOLO);
                 return;
             }
-    voice_start(t, L_SOLO, midi, bl_note_hz(midi), vel, SOLO_TRIM[t], fm_clampf((float)(midi - 66) / 20.0f, -0.5f, 0.5f),
+    g = fm_clampf(vel, 0.0f, 1.0f);
+    g = 0.22f + 0.78f * g * (0.7f + 0.3f * g);        /* the touch: about 14 dB, soft to hard */
+    voice_start(t, L_SOLO, midi, bl_note_hz(midi), vel, SOLO_TRIM[t] * g, fm_clampf((float)(midi - 66) / 20.0f, -0.5f, 0.5f),
                 is_pad(t) ? 0.3f : t == BV_FLUTE ? 0.12f : 0.0f, is_pad(t) ? 2.5f : 0.0f, -1.0f);
     ev_note(midi, t, vel, L_SOLO);
+}
+
+
+/* ------------------------------------------------------------------------------------------- the keys --- */
+/* Every key sounds at once, in the mood's touch voice. What's held leads the band: two or more notes are its chord
+ * (filled out); one note held on its own a moment, outside the chord, is a chord on that note; quick notes are a
+ * tune over it. The band makes room while they play, and when a line stops the melody answers it. Let go and the
+ * chord sustains ten seconds, then the band goes on by itself (PLAY) or fades. */
+static void keys_line(int midi)
+{
+    if (K.line_n && clk - K.line_t[K.line_n - 1] < SEC(0.06f)) {   /* a chord's notes: one press, its top note */
+        if (midi > K.line[K.line_n - 1])
+            K.line[K.line_n - 1] = (int8_t)midi;
+        return;
+    }
+    if (K.line_n == KLINE) {
+        int k;
+        for (k = 1; k < KLINE; k++) {
+            K.line[k - 1] = K.line[k];
+            K.line_t[k - 1] = K.line_t[k];
+        }
+        K.line_n--;
+    }
+    K.line[K.line_n] = (int8_t)midi;
+    K.line_t[K.line_n] = clk;
+    K.line_n++;
+    K.groups++;
+}
+
+static void key_on(int midi, float vel)
+{
+    int i;
+    solo_note(midi, vel);
+    if (ST.len)                                         /* a sting: the keys only play */
+        return;
+    for (i = 0; i < K.n; i++)
+        if (K.note[i] == midi)
+            break;
+    if (i == K.n && K.n < KMAX) {
+        K.note[K.n] = (int8_t)midi;
+        K.on_at[K.n] = clk;
+        K.n++;
+    }
+    keys_line(midi);
+    K.ever = 1;
+    K.last_on = clk;
+    K.last_note = midi;
+    K.answer_at = clk + SEC(rng_range(&rng, 2.2f, 3.4f));
+    K.energy += 0.35f * (fm_clampf(vel * 1.15f, 0.0f, 1.0f) - K.energy);
+    K.harm_at = clk + SEC(0.08f);
+    K.dirty = 1;
+    if (G.on) {                                         /* the melody waits for them */
+        sched_clear(L_FLUTE);
+        sched_clear(L_BELL);
+        for (i = 0; i < NVOICES; i++)
+            if (V[i].on && V[i].gate && V[i].layer == L_FLUTE)
+                voice_release(&V[i], 0.8f);
+    }
+}
+
+static void key_off(int midi)
+{
+    int i;
+    solo_note(midi, 0.0f);
+    for (i = 0; i < K.n; i++)
+        if (K.note[i] == midi) {
+            K.n--;
+            K.note[i] = K.note[K.n];
+            K.on_at[i] = K.on_at[K.n];
+            break;
+        }
+    if (K.n == 0)
+        K.off_at = clk;
+}
+
+/* the melody answers the line: its last few presses echoed, turned upside down or played backwards, in the
+ * melody's register and the scale, at the player's own pace (a little slower), ending on a note of the chord */
+static void keys_answer(void)
+{
+    int n = K.groups < 5 ? K.groups : 5, a[5], k, form = rng_int(&rng, 3), flute = mo()->melody == BV_FLUTE;
+    int lo = flute ? 67 : 76, hi = flute ? 84 : 91, mid = (lo + hi) / 2, sum = 0, sh;
+    float gap[5], t = 0.0f, vel = (flute ? 0.55f : 0.42f) * (0.75f + 0.4f * K.energy);
+    int first = K.line_n - n;
+    if (n > K.line_n)
+        return;
+    for (k = 0; k < n; k++) {
+        int j = form == 2 ? K.line_n - 1 - k : first + k;
+        a[k] = K.line[j];
+        if (form == 1)                                  /* upside down, about the first note */
+            a[k] = 2 * K.line[first] - K.line[first + k];
+        gap[k] = k + 1 < n ? (float)(K.line_t[first + k + 1] - K.line_t[first + k]) * BL_INV_SR : 1.0f;
+        sum += a[k];
+    }
+    sh = mid * n - sum;                                 /* into the register, by octaves */
+    sh = 12 * ((sh + 6 * n + 1200 * n) / (12 * n) - 100);
+    for (k = 0; k < n; k++) {
+        static const int8_t near[5] = {0, 1, -1, 2, -2};
+        int x = a[k] + sh, d;
+        while (x < lo - 2)
+            x += 12;
+        while (x > hi + 2)
+            x -= 12;
+        for (d = 0; d < 5 && !in_scale(x + near[d]); d++)   /* the scale's nearest */
+            ;
+        if (d < 5)
+            x += near[d];
+        if (k == n - 1) {                               /* and home on the chord */
+            int C[32], m = chord_list(C, lo - 3, hi + 3), j, bd = 99, to = x;
+            for (j = 0; j < m; j++) {
+                int dd = C[j] > x ? C[j] - x : x - C[j];
+                if (dd < bd) {
+                    bd = dd;
+                    to = C[j];
+                }
+            }
+            x = to;
+        }
+        a[k] = x;
+    }
+    for (k = 0; k < n; k++) {
+        float g = fm_clampf(gap[form == 2 ? n - 1 - k : k] * rng_range(&rng, 1.0f, 1.3f), 0.25f, 1.2f);
+        int last = k == n - 1;
+        if (flute)
+            sched(clk + SEC(t), BV_FLUTE, L_FLUTE, a[k], vel, k ? 0.0f : rng_range(&rng, -0.2f, 0.2f),
+                  last ? rng_range(&rng, 3.0f, 4.5f) : g, k ? 0.0f : 0.25f, last ? 1.6f : 0.0f, k > 0);
+        else
+            sched(clk + SEC(t), BV_BELLS, L_BELL, a[k], vel * (k ? 0.9f : 1.0f), rng_range(&rng, -0.4f, 0.4f), 6.0f, 0, 0, 0);
+        t += g;
+    }
+}
+
+/* the sustain ran out: the band goes on by itself from the keys' chord (PLAY), or lets go */
+static void keys_release(void)
+{
+    const mood_t *m = mo();
+    int p, k, d = H.cur.root;
+    K.hands = 0;
+    if (!G.autoplay) {
+        grove_stop(8.0f);
+        return;
+    }
+    for (p = 0; p < m->nprog; p++) {
+        int q = (G.prog + p) % m->nprog;
+        for (k = 0; k < m->plen[q]; k++)
+            if (pcm(m->prog[q][k].c.root) == d) {
+                G.prog = q;
+                G.step = k;
+                p = m->nprog;
+                break;
+            }
+    }
+    H.next_chord = clk + SEC(1.0f);
+    G.mel_rest = clk;
+    G.mel_next = clk + SEC(rng_range(&rng, 4.0f, 10.0f));
+}
+
+static void keys_step(void)
+{
+    int recent = K.ever && clk - K.last_on < SEC(1.5f), holding = K.n > 0 && clk - K.last_on < SEC(6.0f);
+    K.duck += (recent || holding ? 0.019f : 0.0039f) * ((recent || holding ? 1.0f : 0.0f) - K.duck);
+    K.mduck += 0.019f * ((recent ? 1.0f : 0.0f) - K.mduck);
+    if (K.ever && clk - K.last_on > SEC(3.0f))
+        K.energy += 0.0006f * (0.45f - K.energy);
+    if (ST.len)
+        return;
+    if (K.dirty && due(K.harm_at)) {
+        chord_t c;
+        uint16_t held = 0, extra;
+        int k, lo = 127, bass;
+        for (k = 0; k < K.n; k++)
+            if (K.note[k] < lo)
+                lo = K.note[k];
+        for (k = 0; k < K.n; k++)
+            if (K.note[k] <= lo + 24)
+                held |= (uint16_t)(1u << pcm(K.note[k]));
+        uint32_t g0 = K.line_n ? K.line_t[K.line_n - 1] : clk;   /* this press began */
+        int fresh = 0, old = 0, flo = 127, olo = 127;
+        for (k = 0; k < K.n; k++)
+            if ((int32_t)(K.on_at[k] - g0) >= 0) {
+                fresh++;
+                flo = K.note[k] < flo ? K.note[k] : flo;
+            } else {
+                old++;
+                olo = K.note[k] < olo ? K.note[k] : olo;
+            }
+        if (G.on && K.hands && old && fresh && fresh < 3 && flo > olo) {
+            K.dirty = 0;                                /* a note or two over keys already held: a tune over it */
+        } else if (K.n >= 2 && popc(held) >= 2) {       /* a chord: the notes held (a new one, or a new bass) */
+            K.dirty = 0;
+            bass = pcm(lo);
+            if (K.hands && K.n < 3 && (held & ~H.full) == 0 && bass == H.bass_pc)
+                return;                                 /* two notes of the chord it is: it stays */
+            if (!G.on)
+                grove_start(0);
+            extra = chord_match(held, bass, &c);
+            if (!K.hands || H.cur.root != c.root || H.cur.q != c.q || H.bass_pc != bass || (H.full & ~(held | H.full)) ||
+                (held & ~H.full))
+                hands_go(&c, bass, extra);
+        } else {                                        /* one note (or a tap, already up) */
+            int note = K.n ? K.note[0] : K.last_note;
+            uint32_t on = K.n ? K.on_at[0] : K.last_on;
+            if (!G.on) {                                /* the first: a chord on it, and the band */
+                K.dirty = 0;
+                grove_start(0);
+                chord_on(pcm(note), &c);
+                hands_go(&c, pcm(note), 0);
+            } else if (in_chord(note) || !K.n) {        /* a note of the chord, or a quick one: a tune over it */
+                K.dirty = 0;
+                if (!K.hands) {                         /* the band waits for them now */
+                    K.hands = 1;
+                    K.root_abs = pcm(tonic_pc + H.cur.root);
+                    K.seq++;
+                }
+            } else if (clk - on >= SEC(0.35f)) {        /* held on its own, outside the chord: a chord on it */
+                K.dirty = 0;
+                chord_on(pcm(note), &c);
+                hands_go(&c, pcm(note), 0);
+            }
+        }
+    }
+    if (G.on == 1 && K.groups >= 3 && due(K.answer_at) && clk - K.answer_at < SEC(1.0f)) {
+        keys_answer();
+        K.groups = 0;
+    }
+    if (K.hands && K.n == 0 && !K.dirty && clk - K.off_at >= SEC(10.0f))
+        keys_release();
 }
 
 static void events_run(void)
@@ -1051,25 +1805,31 @@ static void events_run(void)
         eq_r++;
         switch (e.type) {
         case E_NOTE:
-            solo_note(e.a, e.f);
+            if (e.f > 0.0f)
+                key_on(e.a, e.f);
+            else
+                key_off(e.a);
             break;
         case E_GROVE:
-            if (e.a && !G.on) {
-                if (ST.len) {
-                    hard_stop();
-                    ST.len = 0;
-                }
-                muted = 1.0f;
-                mute_tgt = 1.0f;
-                grove_start();
-            } else if (!e.a && G.on)
-                grove_stop(9.0f);
+            if (e.a && !G.on)
+                grove_start(1);
+            else if (e.a && G.on == 1 && !G.autoplay) {   /* the keys' band: from now on by itself too */
+                G.autoplay = 1;
+                G.start = clk;
+                G.sect = SC_BLOOM;
+                G.sect_end = clk + SEC(rng_range(&rng, 120.0f, 200.0f));
+            } else if (!e.a && G.on) {
+                G.autoplay = 0;
+                if (!K.hands)                          /* (the keys' chord fades when they let go) */
+                    grove_stop(9.0f);
+            }
             break;
         case E_STING:
             sting_start(e.b < 1 ? 1 : e.b > 60 ? 60 : e.b, e.c);
             break;
         case E_PANIC:
             hard_stop();
+            K.n = 0;
             ST.len = 0;
             fx_clear();
             break;
@@ -1088,12 +1848,12 @@ void bl_render(float *l, float *r, int n)
     int i, k, sounding;
     voice_ctx_t cx;
     float rt, rev_ret, ech_ret, fbk, sh, peak_l = 0.0f, peak_r = 0.0f, e = 0.0f, tone, ech_time;
-    const season_t *se;
+    const mood_t *mood;
     if (n > BL_BLOCK)
         n = BL_BLOCK;
     events_run();
     shed_run();
-    se = &SEAS[G.season];
+    mood = &MOODS[ST.len ? G.season : G.mood];
     /* the slow LFOs: 47, 73, 131 and 211 seconds */
     {
         static const float per[4] = {47.0f, 73.0f, 131.0f, 211.0f};
@@ -1102,22 +1862,37 @@ void bl_render(float *l, float *r, int n)
             lfo_v[k] = sin1(lfo[k]);
         }
     }
-    now_tone = smooth(now_tone, fm_clampf(P.tone + (G.on ? se->tone : 0.0f) + 0.12f * lfo_v[0], 0.0f, 1.0f), 0.01f);
+    /* the bloom: the sounds open as the piece does, and over each chord, and close again */
+    {
+        float b = 0.55f;
+        if (G.on) {
+            float ph = G.chord_len ? fm_clampf((float)(clk - G.chord_t0) / (float)G.chord_len, 0.0f, 1.0f) : 0.5f;
+            float in = K.hands ? fm_maxf(G.inten, K.energy) : G.inten;   /* the keys play hard: it opens */
+            b = P.bloom * (0.15f + 0.55f * in + 0.25f * sin1(ph * 0.5f) + 0.12f * lfo_v[1]) + (1.0f - P.bloom) * 0.55f;
+            b = fm_clampf(b * (P.talk ? 0.8f : 1.0f), 0.0f, 1.0f);
+        }
+        now_bloom = smooth(now_bloom, b, 0.004f);
+    }
+    now_tone = smooth(now_tone, fm_clampf(P.tone + (G.on ? mood->tone + 0.1f * (now_bloom - 0.5f) : 0.0f) + 0.12f * lfo_v[0], 0.0f, 1.0f), 0.01f);
     now_space = smooth(now_space, P.space, 0.02f);
     now_echo = smooth(now_echo, P.echo, 0.02f);
-    now_shimmer = smooth(now_shimmer, fm_clampf(P.shimmer * (0.85f + 0.15f * lfo_v[1]), 0.0f, 1.0f), 0.02f);
+    now_shimmer = smooth(now_shimmer, fm_clampf(P.shimmer * (0.85f + 0.15f * lfo_v[1]) + (G.on ? 0.25f * (now_bloom - 0.4f) : 0.0f), 0.0f, 1.0f), 0.02f);
     now_level = smooth(now_level, P.level, 0.05f);
-    now_vowel = smooth(now_vowel, fm_clampf(se->vowel + 0.35f * lfo_v[2], 0.0f, 2.0f), 0.002f);
+    now_vowel = smooth(now_vowel, fm_clampf(mood->vowel + 0.3f * lfo_v[2] + (G.on ? 0.8f * (now_bloom - 0.45f) : 0.0f), 0.0f, 2.0f), 0.002f);
     now_bed = smooth(now_bed, P.bed, 0.03f);
     now_melody = smooth(now_melody, P.melody, 0.03f);
+    now_low = smooth(now_low, P.low, 0.03f);
+    now_motion = smooth(now_motion, P.motion, 0.03f);
     now_solo = smooth(now_solo, P.solo_level, 0.05f);
     tone = now_tone;
 
+    keys_step();
     if (ST.len)
         sting_step();
     else if (G.on)
         grove_step();
     sched_run(clk + (uint32_t)n);
+    shed_run();                                        /* a chord's new voices over the budget: now, not a block late */
 
     for (i = 0; i < n; i++) {
         bus_pad[0][i] = bus_pad[1][i] = bus_keys[0][i] = bus_keys[1][i] = bus_dry[0][i] = bus_dry[1][i] = 0.0f;
@@ -1125,24 +1900,29 @@ void bl_render(float *l, float *r, int n)
     }
     cx.tone = tone;
     cx.vowel = now_vowel;
+    cx.bloom = now_bloom;
     for (k = 0; k < NLAYERS; k++)
         cx.lg[k] = 1.0f;
-    cx.lg[L_KEYS] = cx.lg[L_HARP] = cx.lg[L_PLUCK] = cx.lg[L_BELL] = cx.lg[L_FLUTE] = now_melody * (P.talk ? 0.85f : 1.0f);
-    cx.lg[L_PEDAL] = 0.55f;
-    cx.lg[L_SOLO] = now_solo;
+    {
+        static const float one[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        const float *g = ST.len ? one : mood->g;      /* a mood's parts level with each other */
+        float gl = ST.len ? 1.0f : 1.4f;              /* the four parts together as loud as the old Grove */
+        float d = ST.len ? 0.0f : K.duck, dm = ST.len ? 0.0f : K.mduck;   /* the band makes room for the keys */
+        cx.lg[L_KEYS] = cx.lg[L_HARP] = cx.lg[L_PLUCK] = now_motion * g[2] * gl * (P.talk ? 0.85f : 1.0f) * (1.0f - 0.72f * d);
+        cx.lg[L_BELL] = cx.lg[L_FLUTE] = now_melody * g[3] * gl * (P.talk ? 0.85f : 1.0f) * (1.0f - 0.8f * dm);
+        cx.lg[L_PEDAL] = 0.55f * (ST.len ? 1.0f : now_low * g[1] * gl) * (1.0f - 0.3f * d);
+        cx.lg[L_PAD] = now_bed * g[0] * gl * (G.on ? 0.8f + 0.3f * now_bloom : 1.0f) * (1.0f - 0.72f * d);   /* (the low part has its own) */
+    }
+    cx.lg[L_SOLO] = now_solo * 1.35f;              /* the keys on top of the band (it makes room as well) */
     sh = 0.15f + 0.85f * now_shimmer;
     sounding = voices_render(n, &cx, 1.0f, 0.2f + 0.8f * now_echo);
 
     /* the pads through the ensemble, the keys through a gentler one */
-    for (i = 0; i < n; i++) {
-        bus_pad[0][i] *= now_bed;
-        bus_pad[1][i] *= now_bed;
-    }
     chorus_run(&CHO[0], bus_pad[0], bus_pad[1], n, sh, 0.6f + 0.4f * now_shimmer);
     chorus_run(&CHO[1], bus_keys[0], bus_keys[1], n, sh, 0.35f + 0.5f * now_shimmer);
 
     /* echo and hall */
-    ech_time = ST.len ? EC.time : se->echo_s;
+    ech_time = ST.len ? EC.time : mood->echo_s;
     fbk = (0.28f + 0.34f * now_echo) * (ST.len ? 0.7f : 1.0f);
     echo_run(send_ech, ech_l, ech_r, n, ech_time, fbk, tone);
     rt = 2.5f + 9.5f * now_space * now_space;
@@ -1204,8 +1984,23 @@ void bl_render(float *l, float *r, int n)
     S.meter_r = meter_hold[1];
     S.energy += 0.03f * (fm_minf(1.0f, fm_sqrtf(e / (float)(2 * n)) * 4.0f) - S.energy);
     S.cpu_voices = (float)sounding;
-    S.grove = G.on == 0 ? 0 : G.on == 1 ? 1 : 2;
-    S.season = G.season;
+    S.grove = !G.on || !G.autoplay ? 0 : G.on == 1 ? 1 : 2;
+    S.band = G.on != 0;
+    S.hands = K.hands;
+    S.chord_seq = K.seq;
+    S.chord_pcs = G.on || ST.len ? H.full : 0;
+    S.bass_pc = H.bass_pc;
+    S.season = G.on ? G.mood : ST.len ? G.season : P.mood;
+    S.section = G.sect;
+    S.root_pc = G.on || ST.len ? pcm(tonic_pc + H.cur.root) : -1;
+    S.bloom = now_bloom;
+    {
+        int c = 0;
+        for (k = 0; k < NVOICES; k++)
+            if (V[k].on)
+                c += voice_cost(&V[k]);
+        S.cost = (float)c;
+    }
     {
         int rm;
         S.room_now = P.room;
@@ -1240,17 +2035,20 @@ void bl_init(uint32_t seed)
     }
     for (i = 0; i < NSCHED; i++)
         SQ[i].used = 0;
-    P.room = 3;                                        /* HEART: F, and Lydian is the white keys */
-    P.mode = BM_LYDIAN;
+    P.mood = BS_REDWOODS;
+    P.room = MOODS[P.mood].room;                       /* HEART: F, and Lydian is the white keys */
     P.just = 0;
     P.a432 = 0;
     P.activity = 0.5f;
     P.drift = 0.3f;
+    P.bloom = 0.7f;
     P.bed = 0.8f;
-    P.melody = 0.75f;
+    P.low = 0.7f;
+    P.motion = 0.75f;
+    P.melody = 0.7f;
     P.minutes = 0;
-    P.solo = BV_RHODES;
-    P.solo_level = 0.8f;
+    P.solo = bl_mood_touch(P.mood);
+    P.solo_level = 1.0f;
     P.space = 0.6f;
     P.echo = 0.45f;
     P.shimmer = 0.6f;
@@ -1268,6 +2066,9 @@ void bl_init(uint32_t seed)
     now_vowel = 0.5f;
     now_bed = P.bed;
     now_melody = P.melody;
+    now_low = P.low;
+    now_motion = P.motion;
+    now_bloom = 0.55f;
     now_solo = P.solo_level;
     TK.amt = 0.0f;
     TK.last = -1.0f;
@@ -1279,9 +2080,16 @@ void bl_init(uint32_t seed)
     fx_clear();
     all_reseed(seed);
     G.on = 0;
-    G.season = BS_DAWN;
+    G.mood = G.season = P.mood;
+    G.room = P.room;
+    G.autoplay = 0;
+    K.n = K.hands = K.dirty = K.ever = 0;
+    K.line_n = K.groups = 0;
+    K.energy = 0.5f;
+    K.duck = K.mduck = 0.0f;
+    K.seq = 0;
     ST.len = 0;
-    H.mode = P.mode;
+    H.mode = MOODS[P.mood].mode;
     tonic_pc = ROOM_PC[P.room];
     chord_set_to(0);
     H.n = 0;

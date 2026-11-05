@@ -1,0 +1,81 @@
+# The moods and the keys leading the band: base/tools/build.py app --host, then
+#   app/build/host/blissbox_host app/tests/moods.txt OUTDIR
+wait 900
+expect mood 2
+expect room 3
+expect solo 1
+shot mood-redwoods.png
+# SELECT: the mood, its own key (DAWN: D) and its own voice (the harp)
+turn SELECT -2
+wait 30
+expect mood 0
+expect room 1
+expect solo 3
+expect grove 0
+expect band 0
+wait 1500
+shot mood-dawn.png
+# D F# A (keys 9, 13, 16) from silence: the band comes in under them on D, the bass on D
+key 9 down 100 0
+key 13 down 100 0
+key 16 down 100 0
+wait 300
+expect band 1
+expect hands 1
+expect grove 0
+expect root 2
+expect bass 2
+wait 900
+shot chord-d.png
+key 9 up
+key 13 up
+key 16 up
+# one key held (G3, key 2): the scale's chord on G
+wait 1500
+key 2 down 90 0
+wait 600
+expect root 7
+expect bass 7
+key 2 up
+# a tune over a held chord leaves it where it is (B minor: B D F#, then E and A above)
+wait 1500
+key 6 down 90 0
+key 9 down 90 0
+key 13 down 90 0
+wait 600
+expect root 11
+key 23 down 80 0
+wait 200
+key 23 up
+key 16 down 80 0
+wait 200
+key 16 up
+wait 300
+expect root 11
+key 6 up
+key 9 up
+key 13 up
+# let go with PLAY off: the chord rings, then the band fades
+wait 11000
+expect hands 0
+expect grove 0
+wait 12000
+expect band 0
+# the pages: HOME, then HOME again for the band's levels
+tap LFO
+wait 30
+tap HOME
+wait 30
+expect page 0
+turn K1 5
+wait 100
+shot home.png
+tap HOME
+wait 30
+expect page 5
+turn K1 -5
+wait 100
+shot mix.png
+tap LFO
+wait 30
+shot grove-page.png

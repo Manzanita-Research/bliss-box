@@ -5,8 +5,16 @@
  *   build/render grove 600 out.wav [key=value ...]
  *   build/render sting 10 out.wav seed=1234
  *   build/render solo rhodes out.wav
- * Keys: room mode just a432 activity drift bed melody minutes space echo shimmer tone talk tape wear hiss level seed
- * It prints the peak, the RMS, and the clipped-sample count. */
+ *   build/render play tools/play/dawn.txt out.wav mood=0
+ * Keys: mood room just a432 activity drift bloom bed low motion melody minutes space echo shimmer tone talk tape wear
+ * hiss level seed solo solo_level
+ * A play script is somebody at the keys, a line each (# a comment):
+ *   SECONDS NOTES VEL LEN   NOTES: the mood's scale degrees, comma-separated (1 the tonic, 8 or 6 an octave up, 0 and
+ *                           below the notes under it), or MIDI notes as m62; all at once (a chord), VEL 0..1, held LEN s
+ *   SECONDS play | stop     PLAY on or off
+ *   SECONDS end             where the render stops
+ * mood= sets the room to the mood's own key; give room= after it to move it.
+ * It prints the peak, the RMS, the clipped-sample count and the voices' cost (the FM-1's budget is 180). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,7 +24,12 @@
 
 static FILE *wav;
 static uint32_t frames;
-static double sumsq;
+static double sumsq, cost_sum;
+static float cost_peak;
+static long cost_n, cost_over;
+static int logc;
+static char last_chord[16];
+static int last_sect = -1;
 static float peak;
 static long clipped;
 
@@ -65,6 +78,19 @@ static void run(double seconds)
     while (done < n) {
         int k = n - done < BL_BLOCK ? (int)(n - done) : BL_BLOCK, i;
         bl_render(l, r, k);
+        cost_sum += bl_status()->cost;
+        cost_n++;
+        cost_over += bl_status()->cost > 180.0f;
+        if (logc && (strcmp(last_chord, bl_status()->chord_name) || last_sect != bl_status()->section)) {
+            static const char *SN[4] = {"arrive", "bloom", "float", "return"};
+            const bl_status_t *st = bl_status();
+            printf("  %6.1f  %-8s %-7s %-10s bloom %.2f\n", frames / 44100.0, bl_season_name(st->season),
+                   st->grove ? SN[st->section & 3] : st->band ? (st->hands ? "keys" : "band") : "-", st->chord_name, st->bloom);
+            strcpy(last_chord, st->chord_name);
+            last_sect = st->section;
+        }
+        if (bl_status()->cost > cost_peak)
+            cost_peak = bl_status()->cost;
         for (i = 0; i < k; i++) {
             put(l[i]);
             put(r[i]);
@@ -97,9 +123,15 @@ static void set(const char *kv)
     v = (float)atof(eq + 1);
 #define F(name) else if (!strcmp(k, #name)) p->name = v
 #define I(name) else if (!strcmp(k, #name)) p->name = (int)v
-    if (!strcmp(k, "seed")) seed = (uint32_t)strtoul(eq + 1, 0, 10);
+    if (!strcmp(k, "log")) logc = (int)v;
+    else if (!strcmp(k, "seed")) seed = (uint32_t)strtoul(eq + 1, 0, 10);
+    else if (!strcmp(k, "mood")) {
+        p->mood = (int)v;
+        p->room = bl_mood_room(p->mood);
+        p->solo = bl_mood_touch(p->mood);
+    }
     else if (!strcmp(k, "solo")) p->solo = voice_by_name(eq + 1);
-    I(room); I(mode); I(just); I(a432); F(activity); F(drift); F(bed); F(melody); I(minutes);
+    I(room); I(just); I(a432); F(activity); F(drift); F(bloom); F(bed); F(low); F(motion); F(melody); I(minutes);
     F(space); F(echo); F(shimmer); F(tone); I(talk); I(tape); F(wear); F(hiss); F(level); F(solo_level);
     else fprintf(stderr, "unknown key %s\n", k);
 }
@@ -139,13 +171,86 @@ static void solo_demo(void)
     run(26.0 - t);
 }
 
+/* somebody at the keys (the script's lines above) */
+typedef struct { double at; int what, note; float vel; } pev_t;   /* what: 0 a key (vel 0 up), 1 PLAY on, 2 off, 3 end */
+static int pev_cmp(const void *a, const void *b)
+{
+    const pev_t *x = a, *y = b;
+    if (x->at != y->at)
+        return x->at < y->at ? -1 : 1;
+    return (x->vel > 0.0f) - (y->vel > 0.0f);           /* at the same moment: the keys up first */
+}
+static double play_script(const char *path)
+{
+    static pev_t ev[2048];
+    char line[256];
+    int ne = 0, i;
+    double t = 0.0, end = 0.0;
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        perror(path);
+        exit(1);
+    }
+    while (fgets(line, sizeof line, f) && ne < 2000) {
+        char notes[128], *tok;
+        double at, len;
+        float vel;
+        if (line[0] == '#' || line[0] == '\n')
+            continue;
+        if (sscanf(line, "%lf %127s", &at, notes) < 2)
+            continue;
+        if (!strcmp(notes, "play") || !strcmp(notes, "stop") || !strcmp(notes, "end")) {
+            ev[ne].at = at;
+            ev[ne].what = notes[0] == 'p' ? 1 : notes[0] == 's' ? 2 : 3;
+            ev[ne].vel = 0.0f;
+            ne++;
+            if (notes[0] == 'e')
+                end = at;
+            continue;
+        }
+        if (sscanf(line, "%lf %127s %f %lf", &at, notes, &vel, &len) < 4)
+            continue;
+        for (tok = strtok(notes, ","); tok && ne < 2000; tok = strtok(0, ",")) {
+            int note = tok[0] == 'm' ? atoi(tok + 1) : bl_scale_note(atoi(tok));
+            ev[ne].at = at;
+            ev[ne].what = 0;
+            ev[ne].note = note;
+            ev[ne].vel = vel;
+            ne++;
+            ev[ne].at = at + len;
+            ev[ne].what = 0;
+            ev[ne].note = note;
+            ev[ne].vel = 0.0f;
+            ne++;
+            if (at + len > end)
+                end = at + len;
+        }
+    }
+    fclose(f);
+    qsort(ev, ne, sizeof ev[0], pev_cmp);
+    for (i = 0; i < ne; i++) {
+        if (ev[i].at > t) {
+            run(ev[i].at - t);
+            t = ev[i].at;
+        }
+        if (ev[i].what == 3)
+            return t;
+        if (ev[i].what)
+            bl_post_grove(ev[i].what == 1);
+        else
+            bl_post_note(ev[i].note, ev[i].vel);
+    }
+    run(end + 15.0 - t);
+    return end + 15.0;
+}
+
 int main(int argc, char **argv)
 {
     int i;
     clock_t c0;
     double secs;
     if (argc < 4) {
-        fprintf(stderr, "usage: render grove SECONDS out.wav [k=v..] | sting SECONDS out.wav [k=v..] | solo VOICE out.wav [k=v..]\n");
+        fprintf(stderr, "usage: render grove SECONDS out.wav [k=v..] | sting SECONDS out.wav [k=v..] | solo VOICE out.wav [k=v..] | play SCRIPT out.wav [k=v..]\n");
         return 2;
     }
     for (i = 4; i < argc; i++)
@@ -170,6 +275,8 @@ int main(int argc, char **argv)
         bl_par()->solo = voice_by_name(argv[2]);
         solo_demo();
         secs = 26.0;
+    } else if (!strcmp(argv[1], "play")) {
+        secs = play_script(argv[2]);
     } else {
         fprintf(stderr, "unknown mode %s\n", argv[1]);
         return 2;
@@ -180,6 +287,8 @@ int main(int argc, char **argv)
         double rms = sqrt(sumsq / (2.0 * frames));
         printf("%s: %.1fs  peak %.2f dBFS  rms %.1f dBFS  clipped %ld  (%.0fx realtime on this machine)\n", argv[3],
                frames / 44100.0, 20 * log10(peak + 1e-12), 20 * log10(rms + 1e-12), clipped, (frames / 44100.0) / (el + 1e-9));
+        printf("  voice cost: average %.0f, peak %.0f, over the budget (180) %.2f%% of blocks\n", cost_sum / (cost_n ? cost_n : 1),
+               cost_peak, 100.0 * cost_over / (cost_n ? cost_n : 1));
     }
     return 0;
 }

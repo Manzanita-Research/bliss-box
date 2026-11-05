@@ -1,0 +1,7 @@
+# A Grove to listen to: three minutes from PLAY, into OUTDIR.
+#   app/build/host/blissbox_host app/tests/listen.txt OUTDIR
+wait 900
+wav grove.wav
+tap PLAY
+wait 180000
+wavstop

@@ -4,20 +4,25 @@
  * Part of the unity build (device/unity.c, host/plat_host.c), after the platform: gfx.c and announce.c are in scope.
  *
  * The panel
- *   PLAY        the Grove: start, or let it close (a long release)
+ *   SELECT      the mood: its key, its scale, its progressions, the voices of the Grove's four parts
+ *   PLAY        the Grove plays by itself: start, or let it close (a long release); off, the band only follows you
  *   REC         a new sting (a new seed) at the sting length; SEQ plays the last one again; ARP the length
- *   HOME LFO FX ENV EDIT   the pages K1..K4 turn: HOME, GROVE, SPACE, TAPE, TUNING
- *   GLO         TALK: the bed steps back for a voice
+ *   HOME LFO FX ENV EDIT   the pages K1..K4 turn: HOME (BLOOM, MOTION, SPACE, ECHO), GROVE, SPACE, TAPE, TUNING;
+ *               HOME again, MIX (the band's four parts' levels)
+ *   GLO         TALK: the Grove steps back for a voice
  *   SEL         the cassette in or out
  *   SAVE        keeps the settings
- *   OCT- OCT+   the keys' octave
- *   ALGO        the room (the key); PRESET the voice the keys play; SELECT the piece's length
- * The keys play the solo voice with velocity, and so does MIDI in (any channel). */
+ *   OCT- OCT+   the upper keys' octave
+ *   ALGO        the key (a room); PRESET the voice the keys play; HOME held and SELECT turned, the look
+ * Every key plays the mood's own voice with velocity (and so does MIDI in, any channel), and what you hold leads the
+ * band: two or more keys are the chord, one key a chord of the scale on it. From silence the band comes in under
+ * you; let go and the chord rings on a while, then the Grove goes on by itself (PLAY on) or fades (PLAY off).
+ * The keys you hold light; the chord's other notes glow. */
 #include "fastmath.h"
 #include "bliss.h"
 
 /* ---------------------------------------------------------------- settings --- */
-#define SET_MAGIC 0x424C5331u            /* "BLS1" */
+#define SET_MAGIC 0x424C5333u            /* "BLS3": the keys lead (BLS2's settings start afresh) */
 static const uint8_t LENGTHS[] = {0, 5, 10, 15, 20, 30, 45, 60};   /* the piece, minutes (0: endless) */
 static const uint8_t STING_S[] = {3, 5, 10, 30};
 #define NLENGTHS (sizeof LENGTHS)
@@ -49,10 +54,10 @@ static int f01(float v) { return v >= 0.0f && v <= 1.0f; }   /* (false for a NaN
 static int settings_ok(const settings_t *s)
 {
     const bl_par_t *p = &s->par;
-    return s->magic == SET_MAGIC && p->room >= 0 && p->room < 7 && p->mode >= 0 && p->mode < BM_NMODES &&
+    return s->magic == SET_MAGIC && p->room >= 0 && p->room < 7 && p->mood >= 0 && p->mood < BL_NMOODS &&
            (p->just | p->a432 | p->talk | p->tape) <= 1 && p->just >= 0 && p->a432 >= 0 && p->talk >= 0 &&
            p->tape >= 0 && p->solo >= 0 && p->solo < BV_NTYPES && f01(p->activity) && f01(p->drift) &&
-           f01(p->bed) && f01(p->melody) && f01(p->solo_level) && f01(p->space) && f01(p->echo) &&
+           f01(p->bloom) && f01(p->bed) && f01(p->low) && f01(p->motion) && f01(p->melody) && f01(p->solo_level) && f01(p->space) && f01(p->echo) &&
            f01(p->shimmer) && f01(p->tone) && f01(p->wear) && f01(p->hiss) && f01(p->level) &&
            s->octave >= -2 && s->octave <= 2 && s->length < NLENGTHS && s->sting < NSTINGS;
 }
@@ -108,7 +113,7 @@ void app_init(void)
 }
 
 /* ------------------------------------------------------------------- pages --- */
-enum { K_F, K_ROOM, K_MODE, K_BOOL };
+enum { K_F, K_ROOM, K_LEN, K_BOOL };
 typedef struct {
     const char *name;
     uint8_t kind;
@@ -116,15 +121,16 @@ typedef struct {
 } knob_t;
 #define KF(n, f) {n, K_F, (uint8_t)__builtin_offsetof(bl_par_t, f)}
 #define KI(n, k, f) {n, k, (uint8_t)__builtin_offsetof(bl_par_t, f)}
-enum { PG_HOME, PG_GROVE, PG_SPACE, PG_TAPE, PG_TUNING, NPAGES };
-static const char *const PAGE_NAME[NPAGES] = {"HOME", "GROVE", "SPACE", "TAPE", "TUNING"};
-static const uint8_t PAGE_BTN[NPAGES] = {B_HOME, B_LFO, B_FX, B_ENV, B_EDIT};
+enum { PG_HOME, PG_GROVE, PG_SPACE, PG_TAPE, PG_TUNING, PG_MIX, NPAGES };
+static const char *const PAGE_NAME[NPAGES] = {"HOME", "GROVE", "SPACE", "TAPE", "TUNING", "MIX"};
+static const uint8_t PAGE_BTN[NPAGES] = {B_HOME, B_LFO, B_FX, B_ENV, B_EDIT, B_HOME};   /* HOME twice: MIX */
 static const knob_t PAGES[NPAGES][4] = {
-    {KF("BED", bed), KF("SOLO", solo_level), KF("SPACE", space), KF("WEAR", wear)},
-    {KF("ACTIVITY", activity), KF("DRIFT", drift), KF("BED", bed), KF("MELODY", melody)},
+    {KF("BLOOM", bloom), KF("MOTION", activity), KF("SPACE", space), KF("ECHO", echo)},   /* what you play with */
+    {{"LENGTH", K_LEN, 0}, KF("DRIFT", drift), KF("SOLO", solo_level), KF("MELODY", melody)},
     {KF("SPACE", space), KF("ECHO", echo), KF("SHIMMER", shimmer), KF("TONE", tone)},
     {KF("WEAR", wear), KF("HISS", hiss), KI("TAPE", K_BOOL, tape), KF("LEVEL", level)},
-    {KI("ROOM", K_ROOM, room), KI("MODE", K_MODE, mode), KI("JUST", K_BOOL, just), KI("A432", K_BOOL, a432)},
+    {KI("KEY", K_ROOM, room), KF("DRIFT", drift), KI("JUST", K_BOOL, just), KI("A432", K_BOOL, a432)},
+    {KF("PAD", bed), KF("LOW", low), KF("MOTION", motion), KF("MELODY", melody)},          /* the band's four parts */
 };
 
 static float *kf(const knob_t *k) { return (float *)((char *)bl_par() + k->off); }
@@ -164,9 +170,13 @@ static void knob_value(const knob_t *k, char *t)
         text_cat(t, " ");
         text_cat(t, bl_room_name(*ki(k)));
         break;
-    case K_MODE:
+    case K_LEN:
         t[0] = 0;
-        text_cat(t, bl_mode_name(*ki(k)));
+        if (LENGTHS[set.length]) {
+            int_text(LENGTHS[set.length], t);
+            text_cat(t, " MIN");
+        } else
+            text_cat(t, "ENDLESS");
         break;
     default:
         t[0] = 0;
@@ -178,7 +188,7 @@ static float knob_frac(const knob_t *k)
     switch (k->kind) {
     case K_F: return *kf(k);
     case K_ROOM: return (float)*ki(k) / 6.0f;
-    case K_MODE: return (float)*ki(k) / (float)(BM_NMODES - 1);
+    case K_LEN: return (float)set.length / (float)(NLENGTHS - 1);
     default: return (float)*ki(k);
     }
 }
@@ -200,6 +210,7 @@ static struct {
     int turned;                          /* the knob last turned (lit a moment), -1 none */
     uint32_t turned_at;
     uint8_t look;                        /* LOOK_*: HOME held and SELECT turned */
+    uint32_t chord_seq, chord_at;        /* the keys' last chord, and when it came (the screen shows it big) */
 } ui;
 
 void app_say(const char *a, const char *b)
@@ -242,8 +253,9 @@ static void knob_turn(int i, int32_t e)
     case K_ROOM:
         *ki(k) = (int)clamp(*ki(k) + e, 0, 6);
         break;
-    case K_MODE:
-        *ki(k) = (int)clamp(*ki(k) + e, 0, BM_NMODES - 1);
+    case K_LEN:
+        set.length = (uint8_t)clamp((int32_t)set.length + e, 0, (int32_t)NLENGTHS - 1);
+        bl_par()->minutes = LENGTHS[set.length];
         break;
     default:
         *ki(k) = e > 0;
@@ -299,6 +311,8 @@ static void button(uint32_t k)
     uint32_t p;
     for (p = 0; p < NPAGES; p++)
         if (PAGE_BTN[p] == k) {
+            if (k == B_HOME && ui.page == PG_HOME)
+                p = PG_MIX;
             ui.page = (uint8_t)p;
             app_say(PAGE_NAME[p], "");
             return;
@@ -407,7 +421,7 @@ static void input(void)
         text_cat(t, bl_room_key(bl_par()->room));
         text_cat(t, " ");
         text_cat(t, bl_room_name(bl_par()->room));
-        app_say("ROOM", t);
+        app_say("KEY", t);
         dirty();
     }
     if ((e = plat_enc(EN_PRESET)) != 0) {
@@ -419,18 +433,17 @@ static void input(void)
     if ((e = plat_enc(EN_SELECT)) != 0 && (btn >> B_HOME & 1u)) {
         ui.look = (uint8_t)((ui.look + e + 3 * NLOOKS) % NLOOKS);
         app_say("LOOK", LOOK_NAME[ui.look]);
-    } else if (e != 0) {
-        char t[16];
-        set.length = (uint8_t)clamp((int32_t)set.length + e, 0, (int32_t)NLENGTHS - 1);
-        bl_par()->minutes = LENGTHS[set.length];
-        if (LENGTHS[set.length]) {
-            int_text(LENGTHS[set.length], t);
-            text_cat(t, " MIN");
-        } else {
-            t[0] = 0;
-            text_cat(t, "ENDLESS");
-        }
-        app_say("PIECE", t);
+    } else if (e != 0) {                 /* the mood, and its own key (ALGO moves the key after) */
+        char t[24];
+        solo_all_off();
+        bl_par()->mood = (int)((bl_par()->mood + e + 3 * BL_NMOODS) % BL_NMOODS);
+        bl_par()->room = bl_mood_room(bl_par()->mood);
+        bl_par()->solo = bl_mood_touch(bl_par()->mood);   /* the keys play the mood's own voice (PRESET another) */
+        t[0] = 0;
+        text_cat(t, bl_room_key(bl_par()->room));
+        text_cat(t, " ");
+        text_cat(t, bl_mode_name(bl_mood_mode(bl_par()->mood)));
+        app_say(bl_season_name(bl_par()->mood), t);
         dirty();
     }
     midi_in();
@@ -452,13 +465,20 @@ static void input(void)
     {                                    /* the lights only when they change: the main loop spins fast */
         static uint32_t was_b = ~0u, was_k = ~0u;
         static int was_red = -1;
+        static uint32_t was_m = ~0u;
         int red = bl_status()->grove == 2;
-        if ((btn | lit) != was_b || keys != was_k || red != was_red) {
+        uint32_t pcs = bl_status()->chord_pcs, kl = keys, km = 0;
+        for (k = 0; k < NKEYS; k++)      /* the chord's notes glow on every key that plays them (key 0 is F) */
+            if (pcs >> ((5u + k) % 12u) & 1u)
+                km |= 1u << k;
+        if ((btn | lit) != was_b || kl != was_k || km != was_m || red != was_red) {
             plat_play_red(red);
             plat_glow(1);
-            plat_leds(btn | lit, keys);
+            plat_leds(btn | lit, kl);
+            plat_lights_mid(0, km);
             was_b = btn | lit;
-            was_k = keys;
+            was_k = kl;
+            was_m = km;
             was_red = red;
         }
     }
@@ -467,12 +487,12 @@ static void input(void)
 void app_input_only(void) { input(); }
 
 /* ------------------------------------------------------------------ screen --- */
-/* the sky: a gradient by season, a sun that breathes with the music, redwoods, and a spark for each note */
+/* the sky: a gradient by mood (the one chosen, resting), a sun that breathes with the music, redwoods, and a spark for each note */
 typedef struct { uint8_t top[3], mid[3], low[3], sun[3]; } sky_t;
 static const sky_t SKY[BS_NSEASONS + 1] = {
     {{38, 30, 92}, {196, 120, 168}, {252, 176, 128}, {255, 226, 170}},   /* DAWN */
     {{24, 18, 64}, {120, 64, 140}, {236, 132, 150}, {255, 200, 190}},    /* TEMPLE */
-    {{48, 104, 176}, {150, 170, 210}, {246, 212, 168}, {255, 246, 210}}, /* GARDEN */
+    {{48, 104, 176}, {150, 170, 210}, {246, 212, 168}, {255, 246, 210}}, /* REDWOODS */
     {{4, 4, 22}, {22, 18, 70}, {70, 44, 110}, {220, 220, 255}},          /* STARS */
     {{30, 40, 78}, {98, 112, 160}, {170, 170, 200}, {240, 236, 255}},    /* STILL */
     {{16, 56, 92}, {60, 140, 160}, {150, 214, 200}, {230, 255, 240}},    /* RIVER */
@@ -561,7 +581,7 @@ static void draw_sparks(uint32_t now)     /* a spark for each note, rising and f
 static void draw_redwood(uint32_t now)
 {
     const bl_status_t *st = bl_status();
-    int s = st->grove || st->sting_len ? st->season : BS_NSEASONS, i, j;
+    int s = st->season, i, j;
     int32_t y, cy = 118, cx = 120;
     float rr, glow = 0.0f;
     (void)j;
@@ -607,7 +627,6 @@ static void draw_redwood(uint32_t now)
         }
     }
     cv_rect(0, 138, 240, 6, RGB(14, 12, 26));
-    cv_blit(0, 32);
 }
 
 /* --- SPECTRUM: seven rings, root to crown from the outside in, each lit by the notes that fall on it; the room's
@@ -630,7 +649,7 @@ static void disc_rows(int32_t cx, int32_t cy, float r, uint16_t c)
 static void draw_spectrum(uint32_t now)
 {
     const bl_status_t *st = bl_status();
-    int playing = st->grove || st->sting_len, k, room = bl_par()->room;
+    int playing = st->band || st->sting_len, k, room = bl_par()->room;
     float breath = 0.94f + 0.08f * st->energy + 0.012f * fm_sinf((float)(now % 60000u) * 0.0011f);
     static const float BG[3] = {10, 8, 24};
     take_events(now);
@@ -655,7 +674,6 @@ static void draw_spectrum(uint32_t now)
         ring_glow[k] *= 0.93f;
     }
     disc_rows(120, 72, 8.0f * breath, RGB(255, 244, 230));        /* the bindu */
-    cv_blit(0, 32);
 }
 
 /* --- J-CARD: the cassette itself, on an airbrushed sky over a grid that runs to the horizon; the reels turn
@@ -675,7 +693,7 @@ static void reel(int32_t cx, int32_t cy, float pack, float ang)
 static void draw_jcard(uint32_t now)
 {
     const bl_status_t *st = bl_status();
-    int s = st->grove || st->sting_len ? st->season : BS_NSEASONS, playing = st->grove || st->sting_len;
+    int s = st->season, playing = st->band || st->sting_len;
     int32_t y, i;
     float prog, ang = playing ? (float)(now % 100000u) * 0.0021f : 0.0f;
     static const float GRID[3] = {246, 150, 210};
@@ -713,14 +731,13 @@ static void draw_jcard(uint32_t now)
            : st->sting_len ? st->sting_pos : 0.35f;
     reel(96, 80, 8.0f + 7.0f * (1.0f - prog), ang);
     reel(144, 80, 8.0f + 7.0f * prog, ang * 1.3f);
-    cv_blit(0, 32);
 }
 
 /* --- PAINTED: an airbrushed sky for each season (tools/paint.py, app/paint.h), dissolving into the next as the
  * Grove turns; stars twinkle on the night ones and the notes spark over it */
 #include "paint.h"
 static const uint8_t SEASON_PAINT[BS_NSEASONS + 1] = {
-    PAINT_REDWOOD_DAWN, PAINT_COSMIC_RINGS, PAINT_REDWOOD_DAWN,  /* dawn, temple, garden */
+    PAINT_REDWOOD_DAWN, PAINT_COSMIC_RINGS, PAINT_REDWOOD_DAWN,  /* dawn, temple, redwoods */
     PAINT_COAST_AURORA, PAINT_REDWOOD_DUSK, PAINT_COAST_AURORA,  /* stars, still, river */
     PAINT_REDWOOD_DUSK,                                          /* resting */
 };
@@ -743,7 +760,7 @@ static inline uint32_t paint_hash(uint32_t i)   /* a hash with no pattern in it:
 static void draw_painted(uint32_t now)
 {
     const bl_status_t *st = bl_status();
-    int s = st->grove || st->sting_len ? st->season : BS_NSEASONS, k;
+    int s = st->season, k;
     uint32_t i;
     take_events(now);
     if (!paint.loaded) {
@@ -790,7 +807,34 @@ static void draw_painted(uint32_t now)
         }
     }
     draw_sparks(now);
-    cv_blit(0, 32);
+}
+
+/* the keys' chord, big over the sky for a moment (2.5 s): the root in the big face (capitals), the rest beside it */
+#define CHORD_MS 2500u
+static void draw_chord(uint32_t now)
+{
+    const bl_status_t *st = bl_status();
+    char root[2] = {st->chord_name[0], 0};
+    const char *rest = st->chord_name[0] ? st->chord_name + 1 : "";
+    int32_t w, x, y = 52;
+    uint32_t age;
+    if (st->chord_seq != ui.chord_seq) {
+        ui.chord_seq = st->chord_seq;
+        ui.chord_at = now | 1u;
+    }
+    age = now - ui.chord_at;
+    if (!ui.chord_at || !st->hands || !root[0] || age >= CHORD_MS)
+        return;
+    {
+        float f = age < CHORD_MS - 600u ? 1.0f : (float)(CHORD_MS - age) / 600.0f;   /* it fades the last 0.6 s */
+        uint16_t fg = RGB((int)(255.0f * f), (int)(244.0f * f), (int)(230.0f * f));
+        uint16_t accent = RGB((int)(246.0f * f), (int)(170.0f * f), (int)(140.0f * f));
+        w = text_w(&APP_BIG_FONT, root) + 2 + text_w(&FONT_B, rest);
+        x = (240 - w) / 2;
+        cv_rect(x - 10, y - 6, w + 20, 44, RGB(8, 6, 18));     /* a dark card under it, so it reads on any sky */
+        x = cv_text(x, y, &APP_BIG_FONT, root, fg);
+        cv_text(x + 2, y + 13, &FONT_B, rest, accent);    /* on the root's baseline */
+    }
 }
 
 static void draw_sky(uint32_t now)
@@ -803,6 +847,8 @@ static void draw_sky(uint32_t now)
         draw_jcard(now);
     else
         draw_redwood(now);
+    draw_chord(now);
+    cv_blit(0, 32);
 }
 
 static void time_text(uint32_t s, char *t)
@@ -863,6 +909,8 @@ static void draw_header(uint32_t now)
                 text_cat(t, ":00");
             }
             cv_text(232 - text_w(&FONT_S, t), 8, &FONT_S, t, st->grove == 2 ? RGB(246, 170, 140) : C_WHITE);
+        } else if (st->band) {                   /* PLAY off, the band following the keys */
+            cv_text(232 - text_w(&FONT_XS, "FOLLOWING YOU"), 10, &FONT_XS, "FOLLOWING YOU", C_GRAY);
         } else {
             int_text((int32_t)plat_cpu_pct(), t);
             text_cat(t, "%");
@@ -878,8 +926,8 @@ static void draw_footer(uint32_t now)
     char t[32];
     int32_t x, i;
     cv_begin(240, 64, C_BLACK);
-    /* the voice and octave on the right; on the left the room's key, then what fits of the chord, the season,
-     * the room's name and the mode (in that order of need), drawn in reading order */
+    /* the voice and octave on the right; on the left the key, then what fits of the chord, the mood, the room's
+     * name and the scale (in that order of need), drawn in reading order */
     t[0] = 0;
     text_cat(t, bl_voice_name(bl_par()->solo));
     text_cat(t, set.octave < 0 ? " -" : set.octave > 0 ? " +" : "");
@@ -890,9 +938,9 @@ static void draw_footer(uint32_t now)
     i = 232 - text_w(&FONT_XS, t);
     cv_text(i, 6, &FONT_XS, t, RGB(246, 170, 140));
     {
-        int playing = st->grove || st->sting_len;
-        const char *name[4] = {playing ? st->chord_name : 0, playing ? bl_season_name(st->season) : 0,
-                               bl_room_name(bl_par()->room), bl_mode_name(bl_par()->mode)};
+        int playing = st->band || st->sting_len;
+        const char *name[4] = {playing ? st->chord_name : 0, bl_season_name(st->season),
+                               bl_room_name(bl_par()->room), bl_mode_name(bl_mood_mode(bl_par()->mood))};
         int show[4] = {0, 0, 0, 0}, k;
         int32_t room = i - 8;                         /* the left group ends 8 px before the voice */
         x = 8 + text_w(&FONT_B, bl_room_key(bl_par()->room));
@@ -932,7 +980,9 @@ static void speak(void)
     if (ann_on() && ann_where()) {
         const bl_status_t *st = bl_status();
         t[0] = 0;
-        text_cat(t, "BLISS BOX. ROOM ");
+        text_cat(t, "BLISS BOX. ");
+        text_cat(t, bl_season_name(bl_par()->mood));
+        text_cat(t, " IN ");
         text_cat(t, bl_room_key(bl_par()->room));
         text_cat(t, ". VOICE ");
         text_cat(t, bl_voice_name(bl_par()->solo));
@@ -965,7 +1015,7 @@ void app_frame(void)
     speak();
     if (st->seconds != ui.last_sec || (ui.msg_until && now >= ui.msg_until) ||
         (ui.turned >= 0 && now - ui.turned_at > 600u && now - ui.turned_at < 700u) || st->sting_len ||
-        (ui.btn >> B_HOME & 1u)) {
+        (ui.btn >> B_HOME & 1u) || st->chord_seq != ui.chord_seq) {
         ui.last_sec = st->seconds;
         if (ui.msg_until && now >= ui.msg_until)
             ui.msg_until = 0;
@@ -992,6 +1042,18 @@ int app_expect(const char *what, int *got)
         *got = st->sting_len;
     else if (!strcmp(what, "room"))
         *got = bl_par()->room;
+    else if (!strcmp(what, "mood"))
+        *got = bl_par()->mood;
+    else if (!strcmp(what, "root"))
+        *got = st->root_pc;
+    else if (!strcmp(what, "bass"))
+        *got = st->bass_pc;
+    else if (!strcmp(what, "hands"))
+        *got = st->hands;
+    else if (!strcmp(what, "band"))
+        *got = st->band;
+    else if (!strcmp(what, "chord"))
+        *got = (int)st->chord_pcs;
     else if (!strcmp(what, "solo"))
         *got = bl_par()->solo;
     else if (!strcmp(what, "talk"))

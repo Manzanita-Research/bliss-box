@@ -1,0 +1,39 @@
+# The keys and PLAY: the band follows you, then plays by itself
+#   app/build/host/blissbox_host app/tests/play.txt OUTDIR
+wait 900
+turn SELECT -2
+wait 30
+expect mood 0
+# PLAY: the Grove by itself
+tap PLAY
+wait 3000
+expect grove 1
+expect band 1
+expect hands 0
+# a chord takes it over (A C# E: A), and PLAY stays on
+key 4 down 100 0
+key 8 down 100 0
+key 11 down 100 0
+wait 400
+expect hands 1
+expect root 9
+expect grove 1
+shot hands-a.png
+wait 1200
+key 4 up
+key 8 up
+key 11 up
+# let go: it rings about ten seconds, then the Grove goes on by itself
+wait 6000
+expect hands 1
+wait 6000
+expect hands 0
+expect grove 1
+expect band 1
+shot handed-back.png
+# PLAY off: it closes
+tap PLAY
+wait 30
+expect grove 0
+wait 14000
+expect band 0

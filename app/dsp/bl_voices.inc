@@ -239,10 +239,12 @@ static voice_t *voice_start(int type, int layer, int note, float f, float vel, f
         v->udph[2] = uturns(f * (f * 14.0f < 15000.0f ? 14.0f : 7.0f) * BL_INV_SR);
         v->amp[0] = (0.35f + 1.9f * vel * vel) * 0.159155f;     /* body index, in turns */
         v->amul[0] = t60_mul(1.4f);
-        v->amp[1] = (0.25f + 1.0f * vel) * 0.159155f;           /* tine index */
-        v->amul[1] = t60_mul(0.11f * fm_exp2f(-pitch * 0.5f));
+        v->amp[1] = (0.15f + 0.6f * vel) * 0.159155f;           /* tine index */
+        v->amul[1] = t60_mul(0.09f * fm_exp2f(-pitch * 0.5f));
         v->x[0] = 0.25f * 0.159155f;                            /* the body index never quite goes */
-        v->x[1] = 0.12f + 0.45f * vel;                          /* pickup bark */
+        v->x[1] = 0.1f + 0.3f * vel;                            /* pickup bark */
+        v->x[3] = 0.55f;                                        /* the body: a sine under it all, ringing longer */
+        v->x[4] = t60_mul(t60 * 1.6f);
         break;
     }
     case BV_CP80: {
@@ -257,7 +259,7 @@ static voice_t *voice_start(int type, int layer, int note, float f, float vel, f
         v->x[4] = 0.0f;
         for (n = 0; n < 5; n++) {
             float k = (float)(n + 1), fn = f * k * fm_sqrtf(1.0f + 0.00028f * k * k);
-            float a = fm_powf(k, -tilt) * 0.42f;
+            float a = fm_powf(k, -tilt) * 0.42f * (n == 0 ? 1.5f : n == 1 ? 1.25f : 1.0f);   /* weight below */
             float r = t60_mul(t1 / (1.0f + 0.5f * (float)n * (1.0f + f / 900.0f)));
             int s;
             if (fn >= 9000.0f)
@@ -294,7 +296,7 @@ static voice_t *voice_start(int type, int layer, int note, float f, float vel, f
     case BV_HARP:
     case BV_ZITHER: {
         int zither = type == BV_ZITHER, s;
-        float t60 = fm_clampf(5.5f * fm_exp2f(-pitch * 0.55f), 1.2f, 8.0f) * (zither ? 1.5f : 1.0f);
+        float t60 = fm_clampf(7.5f * fm_exp2f(-pitch * 0.55f), 2.0f, 10.0f) * (zither ? 1.5f : 1.0f);
         float bright = zither ? 0.72f + 0.2f * vel : 0.42f + 0.33f * vel;
         v->perc = 1;
         v->env_c = 1.0f;
@@ -320,11 +322,12 @@ static voice_t *voice_start(int type, int layer, int note, float f, float vel, f
         v->udph[1] = uturns(f * 3.5f * BL_INV_SR);
         v->udph[2] = uturns((f * 2.0f + 0.45f) * BL_INV_SR);
         v->udph[3] = uturns((f * 2.0f + 0.45f) * 1.4142f * BL_INV_SR);
-        v->amp[0] = (0.6f + 1.8f * vel) * 0.159155f;
-        v->amul[0] = t60_mul(1.8f);
-        v->amp[1] = (0.4f + 0.9f * vel) * 0.159155f;
-        v->amul[1] = t60_mul(0.5f);
-        v->amp[2] = 0.33f;                                      /* the strike partial's level */
+        float soft = fm_clampf(fm_exp2f(-0.4f * pitch), 0.45f, 1.1f);   /* gentler up high */
+        v->amp[0] = (0.4f + 1.0f * vel) * soft * 0.159155f;
+        v->amul[0] = t60_mul(1.0f);
+        v->amp[1] = (0.3f + 0.6f * vel) * soft * 0.159155f;
+        v->amul[1] = t60_mul(0.4f);
+        v->amp[2] = 0.22f;                                      /* the strike partial's level */
         v->amul[2] = t60_mul(t60 * 0.35f);
         v->x[0] = 0.18f * 0.159155f;
         break;
@@ -378,7 +381,7 @@ static voice_t *voice_start(int type, int layer, int note, float f, float vel, f
 static float bus_pad[2][BL_BLOCK], bus_keys[2][BL_BLOCK], bus_dry[2][BL_BLOCK];
 static float send_rev[BL_BLOCK], send_ech[BL_BLOCK];
 
-typedef struct { float tone, vowel, lg[NLAYERS]; } voice_ctx_t;
+typedef struct { float tone, vowel, bloom, lg[NLAYERS]; } voice_ctx_t;   /* bloom 0..1: how open the pads are */
 
 /* one voice's block into vbuf; returns 0 when the voice has finished. (restrict: the voice's state stays in
  * registers through the loop instead of being read back after every store to vbuf) */
@@ -389,15 +392,16 @@ static BL_NOINLINE int vb_rhodes(voice_t *restrict v, int n, const voice_ctx_t *
     uint32_t p0 = v->uph[0], p1 = v->uph[1], p2 = v->uph[2], d0 = v->udph[0], d1 = v->udph[1], d2 = v->udph[2];
     float g = v->gain, env = v->env, ec = v->env_c, et = v->env_tgt, dec = v->dec, dm = v->dec_m;
     float a0 = v->amp[0], a1 = v->amp[1], m0 = v->amul[0], m1 = v->amul[1], floor0 = v->x[0], bark = v->x[1];
-    float dc = v->x[2];
+    float dc = v->x[2], body = v->x[3], bm = v->x[4];
     (void)cx;
     for (i = 0; i < n; i++) {
-        float s = sinu(p0 + uturns((a0 + floor0) * sinu(p1) + a1 * sinu(p2)));
+        float b = sinu(p1), s = sinu(p0 + uturns((a0 + floor0) * b + a1 * sinu(p2)));
         env += ec * (et - env);
         s = s + bark * s * s;
         dc += (s - dc) * 0.002f;                                /* DC out */
-        vbuf[i] = (s - dc) * env * dec * g;
+        vbuf[i] = ((s - dc) * dec + b * body) * env * g;
         dec *= dm;
+        body *= bm;
         a0 *= m0;
         a1 *= m1;
         p0 += d0;
@@ -412,6 +416,7 @@ static BL_NOINLINE int vb_rhodes(voice_t *restrict v, int n, const voice_ctx_t *
     v->amp[0] = a0;
     v->amp[1] = a1;
     v->x[2] = dc;
+    v->x[3] = body;
     return 1;
 }
 
@@ -583,8 +588,8 @@ static BL_NOINLINE int vb_strings(voice_t *restrict v, int n, const voice_ctx_t 
     v->x[2] = wrap1(v->x[2] + v->x[3] * (float)n);
     drift = 1.0f + 0.0011f * sin1(v->x[0]);
     cut = (380.0f + 3600.0f * cx->tone * cx->tone) * fm_sqrtf(v->f / 262.0f) * (1.0f + 0.22f * sin1(v->x[2]))
-          * (0.55f + 0.45f * env2);
-    svf_set(&c, cut, 0.75f);
+          * (0.55f + 0.45f * env2) * (0.5f + 1.25f * cx->bloom * cx->bloom);
+    svf_set(&c, fm_minf(cut, 14000.0f), 0.7f + 0.8f * cx->bloom);
     d0 = uturns(v->amp[0] * drift);
     d1 = uturns(v->amp[1] * drift);
     d2 = uturns(v->amp[2] * drift);
@@ -653,7 +658,7 @@ static BL_NOINLINE int vb_choir(voice_t *restrict v, int n, const voice_ctx_t *r
 }
 
 /* the choir's two formant banks onto the pad bus, and its echo send. vowel 0 oo .. 1 oh .. 2 ah */
-static BL_NOINLINE void choir_run(int n, float vowel, float tone, float ech)
+static BL_NOINLINE void choir_run(int n, float vowel, float tone, float bloom, float ech)
 {
     static const float F[3][3] = {{300.0f, 870.0f, 2240.0f}, {460.0f, 820.0f, 2800.0f}, {730.0f, 1090.0f, 2440.0f}};
     static const float A[3][3] = {{1.0f, 0.30f, 0.10f}, {1.0f, 0.45f, 0.14f}, {1.0f, 0.55f, 0.20f}};
@@ -679,7 +684,7 @@ static BL_NOINLINE void choir_run(int n, float vowel, float tone, float ech)
         f2 = F[k][1] + fr * (F[k + 1][1] - F[k][1]);
         f3 = F[k][2] + fr * (F[k + 1][2] - F[k][2]);
         a2 = A[k][1] + fr * (A[k + 1][1] - A[k][1]);
-        a3 = (A[k][2] + fr * (A[k + 1][2] - A[k][2])) * (0.6f + 0.8f * tone);
+        a3 = (A[k][2] + fr * (A[k + 1][2] - A[k][2])) * (0.6f + 0.8f * tone) * (0.5f + bloom);
         svf_set(&c1, f1, f1 / 80.0f);
         svf_set(&c2, f2, f2 / 100.0f);
         svf_set(&c3, f3, f3 / 140.0f);
@@ -701,17 +706,18 @@ static BL_NOINLINE int vb_glass(voice_t *restrict v, int n, const voice_ctx_t *r
     int i;
     uint32_t p0 = v->uph[0], p1 = v->uph[1], p2 = v->uph[2], p3 = v->uph[3], p4 = v->uph[4];
     uint32_t d0 = v->udph[0], d1 = v->udph[1], d2 = v->udph[2], d3 = v->udph[3], d4 = v->udph[4];
-    float g = v->gain, env = v->env, env2 = v->env2, ec = v->env_c, et = v->env_tgt, i1, trem;
+    float g = v->gain, env = v->env, env2 = v->env2, ec = v->env_c, et = v->env_tgt, i1, trem, p2g;
     v->x[0] = wrap1(v->x[0] + v->x[1] * (float)n);
     v->x[2] = wrap1(v->x[2] + v->x[3] * (float)n);
-    i1 = (0.55f + 0.45f * sin1(v->x[0])) * (0.5f + 0.9f * cx->tone) * 0.159155f;
+    i1 = (0.55f + 0.45f * sin1(v->x[0])) * (0.5f + 0.9f * cx->tone) * (0.35f + 1.2f * cx->bloom) * 0.159155f;
+    p2g = 0.12f + 0.32f * cx->bloom;
     trem = 0.07f * (0.5f + 0.5f * sin1(v->x[2]));
     for (i = 0; i < n; i++) {
         float s;
         env += ec * (et - env);
         env2 += ec * (env - env2);
         s = sinu(p0 + uturns(i1 * sinu(p1)));
-        s += 0.3f * sinu(p2 + uturns(0.06f * sinu(p3)));
+        s += p2g * sinu(p2 + uturns(0.06f * sinu(p3)));
         s += trem * sinu(p4);
         vbuf[i] = s * env2 * g;
         p0 += d0;
@@ -829,6 +835,6 @@ static BL_NOINLINE int voices_render(int n, const voice_ctx_t *cx, float sendsca
             }
         }
     }
-    choir_run(n, cx->vowel, cx->tone, TYPE_ECH[BV_CHOIR] * sendscale_ech);
+    choir_run(n, cx->vowel, cx->tone, cx->bloom, TYPE_ECH[BV_CHOIR] * sendscale_ech);
     return sounding;
 }
